@@ -1,0 +1,28 @@
+{
+  "name": "@google/gemini-cli-custom-agent",
+  "version": "0.1.0",
+  "description": "Custom Gemini CLI Agent for AionUi with message editing support",
+  "type": "module",
+  "main": "dist/src/cli.js",
+  "bin": {
+    "custom-agent": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "vitest",
+    "preflight": "npm run build && npm run test"
+  },
+  "dependencies": {
+    "@google/gemini-cli-core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

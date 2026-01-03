@@ -1,5 +1,5 @@
 {
-  "name": "@google/gemini-cli",
+  "name": "flux-cli",
   "version": "0.24.0-nightly.20251227.37be16243",
   "engines": {
     "node": ">=20.0.0"
@@ -69,7 +69,7 @@
     }
   },
   "bin": {
-    "gemini": "bundle/gemini.js"
+    "flux": "packages/custom-agent/dist/src/cli.js"
   },
   "files": [
     "bundle/",

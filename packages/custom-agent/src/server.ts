@@ -129,8 +129,49 @@ export class CustomAgentServer {
 
   /**
    * ACP: Send prompt to active session
+   * Intercepts slash commands before sending to LLM
    */
   private async sendPrompt(params: SendPromptParams): Promise<void> {
+    const { processSlashCommand } = await import('./slashCommandProcessor.js');
+
+    // Check for slash command
+    const slashResult = await processSlashCommand(
+      params.prompt,
+      params.sessionId,
+      this.sessionManager,
+    );
+
+    if (slashResult.handled) {
+      // Emit the command result as a model message
+      if (slashResult.message && this.onSessionUpdate) {
+        this.onSessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            role: 'model',
+            content: slashResult.message,
+          },
+        });
+      }
+
+      // If the command has a prompt to send (e.g., conductor commands)
+      // send it to the LLM
+      if (slashResult.promptToSend) {
+        await this.sessionManager.sendPrompt(
+          params.sessionId,
+          slashResult.promptToSend,
+        );
+        return;
+      }
+
+      // Signal turn complete for non-prompt commands
+      if (this.onEndTurn) {
+        this.onEndTurn();
+      }
+      return;
+    }
+
+    // Not a slash command, proceed with normal message
     await this.sessionManager.sendPrompt(params.sessionId, params.prompt);
   }
 

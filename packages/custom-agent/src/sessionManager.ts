@@ -7,14 +7,23 @@
 /**
  * Session Manager
  *
- * Manages chat sessions with direct history manipulation capabilities.
- * Wraps gemini-cli-core's GeminiChat for the underlying LLM interaction.
+ * Manages chat sessions with real GeminiChat LLM calls.
+ * Uses gemini-cli-core's Config, GeminiClient, and Logger.
  */
 
-import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import * as os from 'node:os';
+import * as crypto from 'node:crypto';
 import type { Content } from '@google/genai';
+import {
+  type Config,
+  type GeminiClient,
+  Storage,
+  Logger,
+  type Checkpoint,
+  debugLogger,
+  GeminiEventType,
+} from '@google/gemini-cli-core';
+import { initConfig } from './initConfig.js';
 import type {
   EditMessageResult,
   SaveFromPointResult,
@@ -22,27 +31,18 @@ import type {
   SessionUpdate,
 } from './types.js';
 
-// Import from gemini-cli-core (workspace dependency)
-// TODO: Import and use actual GeminiChat when ready
-// import { GeminiChat } from '@google/gemini-cli-core';
-
 interface SessionState {
   id: string;
-  // chat: GeminiChat | null; // Will use actual GeminiChat when integrated
   workingDirectory: string;
-  history: Content[];
-}
-
-interface SavedSession {
-  name: string;
-  createdAt: number;
-  workingDirectory: string;
-  history: Content[];
+  config: Config;
+  geminiClient: GeminiClient;
+  storage: Storage;
+  logger: Logger;
+  abortController: AbortController;
 }
 
 export class SessionManager {
   private sessions = new Map<string, SessionState>();
-  private savesDir: string;
 
   // Event callbacks (wired by server.ts)
   onStreamEvent:
@@ -50,42 +50,45 @@ export class SessionManager {
     | null = null;
   onTurnComplete: ((sessionId: string) => void) | null = null;
 
-  constructor() {
-    // Store saves in ~/.gemini/custom-agent/saves/
-    this.savesDir = path.join(os.homedir(), '.gemini', 'custom-agent', 'saves');
-  }
-
   /**
-   * Create a new chat session
+   * Create a new chat session with real LLM capabilities
    */
   async createSession(workingDirectory?: string): Promise<string> {
-    const sessionId = this.generateSessionId();
+    const sessionId = crypto.randomUUID();
     const cwd = workingDirectory ?? process.cwd();
 
-    // TODO: Initialize actual GeminiChat when integrating with gemini-cli-core
-    // For now, we manage history directly
+    // Initialize full Config with GeminiClient
+    const config = await initConfig(sessionId, cwd);
+    const geminiClient = config.getGeminiClient();
+
+    // Use gemini-cli-core's Storage for proper path handling
+    const storage = new Storage(cwd);
+
+    // Create Logger for checkpoint management (shares checkpoints with gemini-cli)
+    const logger = new Logger(sessionId, storage);
+    await logger.initialize();
+
     const session: SessionState = {
       id: sessionId,
       workingDirectory: cwd,
-      history: [],
+      config,
+      geminiClient,
+      storage,
+      logger,
+      abortController: new AbortController(),
     };
 
     this.sessions.set(sessionId, session);
+    debugLogger.log(`[SessionManager] Created session ${sessionId} in ${cwd}`);
     return sessionId;
   }
 
   /**
-   * Send a prompt to the session
+   * Send a prompt to the session using real GeminiChat
    */
   async sendPrompt(sessionId: string, prompt: string): Promise<void> {
     const session = this.getSession(sessionId);
-
-    // Add user message to history
-    const userContent: Content = {
-      role: 'user',
-      parts: [{ text: prompt }],
-    };
-    session.history.push(userContent);
+    const promptId = `${sessionId}-${Date.now()}`;
 
     // Emit user message
     this.emitStreamEvent(sessionId, {
@@ -94,26 +97,85 @@ export class SessionManager {
       content: prompt,
     });
 
-    // TODO: Integrate with GeminiChat.sendMessageStream()
-    // For now, simulate a response
-    const modelContent: Content = {
-      role: 'model',
-      parts: [{ text: `[Placeholder response for: ${prompt}]` }],
-    };
-    session.history.push(modelContent);
+    try {
+      // Use GeminiClient.sendMessageStream for real LLM call
+      const responseStream = session.geminiClient.sendMessageStream(
+        [{ text: prompt }],
+        session.abortController.signal,
+        promptId,
+      );
 
-    // Emit model response
-    const responseText = modelContent.parts?.[0]?.text ?? '';
-    this.emitStreamEvent(sessionId, {
-      sessionUpdate: 'agent_message_chunk',
-      role: 'model',
-      content: responseText,
-    });
+      let fullResponse = '';
+
+      for await (const event of responseStream) {
+        if (event.type === GeminiEventType.Content) {
+          const text = event.value;
+          if (text) {
+            fullResponse += text;
+            // Stream the chunk
+            this.emitStreamEvent(sessionId, {
+              sessionUpdate: 'agent_message_chunk',
+              role: 'model',
+              content: text,
+            });
+          }
+        } else if (event.type === GeminiEventType.Error) {
+          const errorMessage = event.value?.error?.message ?? 'Unknown error';
+          this.emitStreamEvent(sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            role: 'model',
+            content: `[Error: ${errorMessage}]`,
+          });
+          break;
+        } else if (event.type === GeminiEventType.ToolCallRequest) {
+          // Handle tool calls if needed
+          debugLogger.log(
+            `[SessionManager] Tool call requested: ${event.value?.name}`,
+          );
+          // For now, we don't auto-execute tools in custom-agent
+        }
+      }
+
+      debugLogger.log(
+        `[SessionManager] Response complete: ${fullResponse.length} chars`,
+      );
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      debugLogger.error(
+        `[SessionManager] Error in sendPrompt: ${errorMessage}`,
+      );
+      this.emitStreamEvent(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        role: 'model',
+        content: `[Error: ${errorMessage}]`,
+      });
+    }
 
     // Signal turn complete
     if (this.onTurnComplete) {
       this.onTurnComplete(sessionId);
     }
+  }
+
+  /**
+   * Cancel the current request for a session
+   */
+  cancelRequest(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.abortController.abort();
+      // Create new abort controller for future requests
+      session.abortController = new AbortController();
+    }
+  }
+
+  /**
+   * Get conversation history for a session
+   */
+  getHistory(sessionId: string): Content[] {
+    const session = this.getSession(sessionId);
+    return session.geminiClient.getHistory();
   }
 
   /**
@@ -126,40 +188,33 @@ export class SessionManager {
     mode: 'fork' | 'inPlace',
   ): Promise<EditMessageResult> {
     const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
 
-    if (messageIndex < 0 || messageIndex >= session.history.length) {
+    if (messageIndex < 0 || messageIndex >= history.length) {
       throw new Error(`Invalid message index: ${messageIndex}`);
     }
 
-    const originalMessage = session.history[messageIndex];
+    const originalMessage = history[messageIndex];
 
     if (mode === 'inPlace') {
-      // Edit in place: just modify this message, keep everything after
-      session.history[messageIndex] = {
+      // Edit in place: modify history directly
+      history[messageIndex] = {
         ...originalMessage,
         parts: [{ text: newContent }],
       };
+      session.geminiClient.setHistory(history);
       return { success: true };
     } else {
-      // Fork mode: truncate history and regenerate
-      // Truncate history to include only up to (but not including) the edited message
-      const newHistory = session.history.slice(0, messageIndex);
-
-      // Add the edited message
+      // Fork mode: create new session with truncated history
+      const newHistory = history.slice(0, messageIndex);
       newHistory.push({
         ...originalMessage,
         parts: [{ text: newContent }],
       });
 
-      // Create a new session with the truncated + edited history
       const newSessionId = await this.createSession(session.workingDirectory);
       const newSession = this.getSession(newSessionId);
-      newSession.history = newHistory;
-
-      // Emit history snapshot for the new session
-      this.emitHistorySnapshot(newSessionId, newHistory);
-
-      // TODO: Trigger regeneration by calling sendPrompt with empty or continuation
+      newSession.geminiClient.setHistory(newHistory);
 
       return { success: true, newSessionId };
     }
@@ -170,17 +225,19 @@ export class SessionManager {
    */
   async deleteMessage(sessionId: string, messageIndex: number): Promise<void> {
     const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
 
-    if (messageIndex < 0 || messageIndex >= session.history.length) {
+    if (messageIndex < 0 || messageIndex >= history.length) {
       throw new Error(`Invalid message index: ${messageIndex}`);
     }
 
-    // Remove the message
-    session.history.splice(messageIndex, 1);
+    history.splice(messageIndex, 1);
+    session.geminiClient.setHistory(history);
   }
 
   /**
-   * Save conversation from a specific point
+   * Save conversation using gemini-cli-core's Logger
+   * Compatible with gemini CLI's /chat save command
    */
   async saveFromPoint(
     sessionId: string,
@@ -188,31 +245,27 @@ export class SessionManager {
     saveName: string,
   ): Promise<SaveFromPointResult> {
     const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
 
-    if (messageIndex < 0 || messageIndex > session.history.length) {
-      throw new Error(`Invalid message index: ${messageIndex}`);
-    }
+    // Clamp message index to valid range
+    const validIndex = Math.min(Math.max(0, messageIndex), history.length);
+    const historyToSave = history.slice(0, validIndex + 1);
 
-    // Get history up to this point
-    const historyToSave = session.history.slice(0, messageIndex + 1);
-
-    const savedSession: SavedSession = {
-      name: saveName,
-      createdAt: Date.now(),
-      workingDirectory: session.workingDirectory,
+    const checkpoint: Checkpoint = {
       history: historyToSave,
+      authType: session.config.getContentGeneratorConfig()?.authType,
     };
 
-    // Ensure saves directory exists
-    await fs.mkdir(this.savesDir, { recursive: true });
+    await session.logger.saveCheckpoint(checkpoint, saveName);
 
-    const savePath = path.join(this.savesDir, `${saveName}.json`);
-    await fs.writeFile(
-      savePath,
-      JSON.stringify(savedSession, null, 2),
-      'utf-8',
+    const savePath = path.join(
+      session.storage.getProjectTempDir(),
+      `checkpoint-${saveName}.json`,
     );
 
+    debugLogger.log(
+      `[SessionManager] Saved checkpoint "${saveName}" at ${savePath}`,
+    );
     return { success: true, savePath };
   }
 
@@ -226,27 +279,28 @@ export class SessionManager {
     sessionId: string;
     messages: Array<{ role: 'user' | 'model'; content: string }>;
   }> {
-    const savePath = path.join(this.savesDir, `${saveName}.json`);
+    const cwd = workingDirectory ?? process.cwd();
+    const sessionId = await this.createSession(cwd);
+    const session = this.getSession(sessionId);
 
-    let savedSession: SavedSession;
-    try {
-      const data = await fs.readFile(savePath, 'utf-8');
-      savedSession = JSON.parse(data) as SavedSession;
-    } catch {
+    // Load checkpoint
+    const checkpoint = await session.logger.loadCheckpoint(saveName);
+
+    if (checkpoint.history.length === 0) {
       throw new Error(`Save not found: ${saveName}`);
     }
 
-    // Create new session with restored history
-    const cwd = workingDirectory ?? savedSession.workingDirectory;
-    const sessionId = await this.createSession(cwd);
-    const session = this.getSession(sessionId);
-    session.history = savedSession.history;
+    // Resume the GeminiClient with loaded history
+    await session.geminiClient.resumeChat(checkpoint.history);
 
-    // Convert history to simplified message format for UI
-    const messages = savedSession.history.map((content) => ({
+    const messages = checkpoint.history.map((content) => ({
       role: content.role as 'user' | 'model',
       content: content.parts?.map((p) => p.text ?? '').join('') ?? '',
     }));
+
+    debugLogger.log(
+      `[SessionManager] Resumed checkpoint "${saveName}" with ${messages.length} messages`,
+    );
 
     return { sessionId, messages };
   }
@@ -255,25 +309,36 @@ export class SessionManager {
    * List all saved conversations
    */
   async listSaves(): Promise<ListSavesResult> {
+    const storage =
+      this.sessions.size > 0
+        ? Array.from(this.sessions.values())[0].storage
+        : new Storage(process.cwd());
+
+    const checkpointsDir = storage.getProjectTempDir();
+
     try {
-      await fs.mkdir(this.savesDir, { recursive: true });
-      const files = await fs.readdir(this.savesDir);
+      const fs = await import('node:fs/promises');
+      await fs.mkdir(checkpointsDir, { recursive: true });
+      const files = await fs.readdir(checkpointsDir);
 
       const saves: ListSavesResult['saves'] = [];
 
       for (const file of files) {
-        if (!file.endsWith('.json')) continue;
+        if (!file.startsWith('checkpoint-') || !file.endsWith('.json'))
+          continue;
 
         try {
-          const data = await fs.readFile(
-            path.join(this.savesDir, file),
-            'utf-8',
-          );
-          const saved = JSON.parse(data) as SavedSession;
+          const filePath = path.join(checkpointsDir, file);
+          const stats = await fs.stat(filePath);
+          const data = await fs.readFile(filePath, 'utf-8');
+          const checkpoint = JSON.parse(data) as Checkpoint;
+
+          const name = file.slice('checkpoint-'.length, -'.json'.length);
+
           saves.push({
-            name: saved.name,
-            createdAt: saved.createdAt,
-            messageCount: saved.history.length,
+            name,
+            createdAt: stats.mtimeMs,
+            messageCount: checkpoint.history?.length ?? 0,
           });
         } catch {
           // Skip invalid files
@@ -287,9 +352,21 @@ export class SessionManager {
   }
 
   /**
+   * Get history length for a session
+   */
+  getHistoryLength(sessionId: string): number {
+    const session = this.getSession(sessionId);
+    return session.geminiClient.getHistory().length;
+  }
+
+  /**
    * Cleanup on shutdown
    */
   shutdown(): void {
+    for (const session of this.sessions.values()) {
+      session.abortController.abort();
+      session.logger.close();
+    }
     this.sessions.clear();
   }
 
@@ -303,10 +380,6 @@ export class SessionManager {
     return session;
   }
 
-  private generateSessionId(): string {
-    return `session-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-  }
-
   private emitStreamEvent(
     sessionId: string,
     event: SessionUpdate['update'],
@@ -314,17 +387,5 @@ export class SessionManager {
     if (this.onStreamEvent) {
       this.onStreamEvent(sessionId, event);
     }
-  }
-
-  private emitHistorySnapshot(sessionId: string, history: Content[]): void {
-    const messages = history.map((content) => ({
-      role: content.role as 'user' | 'model',
-      content: content.parts?.map((p) => p.text ?? '').join('') ?? '',
-    }));
-
-    this.emitStreamEvent(sessionId, {
-      sessionUpdate: 'history_snapshot',
-      messages,
-    });
   }
 }

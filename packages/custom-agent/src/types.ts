@@ -58,15 +58,22 @@ export interface InitializeResult {
 
 export interface NewSessionParams {
   workingDirectory?: string;
+  cwd?: string;
 }
 
 export interface NewSessionResult {
   sessionId: string;
 }
 
+export interface PromptPart {
+  type?: 'text';
+  text?: string;
+  [key: string]: unknown;
+}
+
 export interface SendPromptParams {
   sessionId: string;
-  prompt: string;
+  prompt: string | PromptPart[];
 }
 
 // Custom extension types
@@ -141,4 +148,32 @@ export interface HistorySnapshotUpdate {
       content: string;
     }>;
   };
+}
+
+// Command types for autocomplete
+export interface SlashCommandInfo {
+  /** Display name in the dropdown (command name or argument value) */
+  name: string;
+  /** Human-readable description */
+  description: string;
+  /** Command category: built-in, user, save, or extension name */
+  category: string;
+  /** Full text to insert when selected */
+  text?: string;
+  /** Whether this is an argument completion (vs command completion) */
+  isArgument?: boolean;
+}
+
+export interface ListCommandsResult {
+  commands: SlashCommandInfo[];
+}
+
+export interface CompleteCommandParams {
+  sessionId?: string;
+  /** Partial command input (e.g., "/cond" or "/chat s") */
+  partial: string;
+}
+
+export interface CompleteCommandResult {
+  suggestions: SlashCommandInfo[];
 }

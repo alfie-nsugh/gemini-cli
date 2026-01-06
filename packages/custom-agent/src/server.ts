@@ -27,12 +27,19 @@ import type {
   ListSavesResult,
   SessionUpdate,
   HistorySnapshotUpdate,
+  ListCommandsResult,
+  CompleteCommandParams,
+  CompleteCommandResult,
 } from './types.js';
 import { SessionManager } from './sessionManager.js';
+
+type RpcRequestSender = (method: string, params?: unknown) => Promise<unknown>;
 
 export class CustomAgentServer {
   private sessionManager: SessionManager;
   private initialized = false;
+  private readonly toolsEnabled =
+    process.env['CUSTOM_AGENT_ENABLE_TOOLS'] !== 'false';
 
   // Event callbacks (wired by cli.ts)
   onSessionUpdate: ((update: SessionUpdate) => void) | null = null;
@@ -58,6 +65,10 @@ export class CustomAgentServer {
     };
   }
 
+  setRpcRequestSender(sender: RpcRequestSender): void {
+    this.sessionManager.setRpcRequestSender(sender);
+  }
+
   /**
    * Route JSON-RPC method to appropriate handler
    */
@@ -69,7 +80,10 @@ export class CustomAgentServer {
       case 'session/new':
         return this.newSession(params as NewSessionParams);
       case 'session/sendPrompt':
-        return this.sendPrompt(params as SendPromptParams);
+      case 'session/prompt':
+        return this.sendPrompt(
+          this.normalizeSendPromptParams(params as SendPromptParams),
+        );
 
       // Custom extension methods
       case 'session/editMessage':
@@ -82,6 +96,12 @@ export class CustomAgentServer {
         return this.resume(params as ResumeParams);
       case 'session/listSaves':
         return this.listSaves();
+
+      // Command completion methods
+      case 'commands/list':
+        return this.listCommands();
+      case 'commands/complete':
+        return this.completeCommand(params as CompleteCommandParams);
 
       default:
         throw new Error(`Unknown method: ${method}`);
@@ -100,7 +120,7 @@ export class CustomAgentServer {
       },
       capabilities: {
         streaming: true,
-        tools: true,
+        tools: this.toolsEnabled,
         customMethods: [
           'session/editMessage',
           'session/deleteMessage',
@@ -122,7 +142,7 @@ export class CustomAgentServer {
       throw new Error('Server not initialized. Call initialize first.');
     }
     const sessionId = await this.sessionManager.createSession(
-      params.workingDirectory,
+      params.workingDirectory ?? params.cwd,
     );
     return { sessionId };
   }
@@ -131,14 +151,19 @@ export class CustomAgentServer {
    * ACP: Send prompt to active session
    * Intercepts slash commands before sending to LLM
    */
-  private async sendPrompt(params: SendPromptParams): Promise<void> {
+  private async sendPrompt(params: {
+    sessionId: string;
+    prompt: string;
+  }): Promise<{ stopReason: 'end_turn' }> {
     const { processSlashCommand } = await import('./slashCommandProcessor.js');
 
     // Check for slash command
+    const config = this.sessionManager.getConfig(params.sessionId);
     const slashResult = await processSlashCommand(
       params.prompt,
       params.sessionId,
       this.sessionManager,
+      config,
     );
 
     if (slashResult.handled) {
@@ -149,7 +174,10 @@ export class CustomAgentServer {
           update: {
             sessionUpdate: 'agent_message_chunk',
             role: 'model',
-            content: slashResult.message,
+            content: {
+              type: 'text',
+              text: slashResult.message,
+            },
           },
         });
       }
@@ -161,18 +189,43 @@ export class CustomAgentServer {
           params.sessionId,
           slashResult.promptToSend,
         );
-        return;
+        return { stopReason: 'end_turn' };
       }
 
       // Signal turn complete for non-prompt commands
       if (this.onEndTurn) {
         this.onEndTurn();
       }
-      return;
+      return { stopReason: 'end_turn' };
     }
 
     // Not a slash command, proceed with normal message
     await this.sessionManager.sendPrompt(params.sessionId, params.prompt);
+    return { stopReason: 'end_turn' };
+  }
+
+  private normalizeSendPromptParams(params: SendPromptParams): {
+    sessionId: string;
+    prompt: string;
+  } {
+    const prompt = params.prompt;
+    if (typeof prompt === 'string') {
+      return { sessionId: params.sessionId, prompt };
+    }
+
+    const parts = Array.isArray(prompt) ? prompt : [];
+    const combined = parts
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && typeof part.text === 'string') {
+          return part.text;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+
+    return { sessionId: params.sessionId, prompt: combined };
   }
 
   /**
@@ -244,6 +297,56 @@ export class CustomAgentServer {
    */
   private async listSaves(): Promise<ListSavesResult> {
     return this.sessionManager.listSaves();
+  }
+
+  /**
+   * List all available slash commands
+   */
+  private async listCommands(): Promise<ListCommandsResult> {
+    const { getAvailableCommands } = await import('./slashCommandProcessor.js');
+    // Use null config since we don't have session context in this RPC yet
+    // This will load user commands from ~/.gemini/commands and global extensions
+    const commands = await getAvailableCommands(null);
+
+    return {
+      commands: commands.map((c) => ({
+        name: `/${c.name}`,
+        description: c.description,
+        category:
+          c.extensionName || (c.kind === 'built-in' ? 'built-in' : 'user'),
+      })),
+    };
+  }
+
+  /**
+   * Complete partial slash command input
+   * Supports both command name completion and argument completion
+   */
+  private async completeCommand(
+    params: CompleteCommandParams,
+  ): Promise<CompleteCommandResult> {
+    const { getCompletions } = await import('./slashCommandProcessor.js');
+    // Use session config if available
+    const config = params.sessionId
+      ? (this.sessionManager.getConfig(params.sessionId) ?? null)
+      : null;
+
+    const completions = await getCompletions(
+      params.partial,
+      this.sessionManager,
+      config,
+    );
+
+    // Map to SlashCommandInfo format for frontend compatibility
+    const suggestions = completions.map((c) => ({
+      name: c.isArgument ? c.displayName : c.text,
+      description: c.description,
+      category: c.category,
+      text: c.text, // Full text to insert
+      isArgument: c.isArgument ?? false,
+    }));
+
+    return { suggestions };
   }
 
   /**

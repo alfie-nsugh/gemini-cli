@@ -13,7 +13,7 @@
 
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import type { Content } from '@google/genai';
+import type { Content, Part } from '@google/genai';
 import {
   type Config,
   type GeminiClient,
@@ -22,6 +22,14 @@ import {
   type Checkpoint,
   debugLogger,
   GeminiEventType,
+  CoreToolScheduler,
+  type ToolCallRequestInfo,
+  type ToolCall,
+  type WaitingToolCall,
+  type CompletedToolCall,
+  ToolConfirmationOutcome,
+  Kind,
+  SHELL_TOOL_NAME,
 } from '@google/gemini-cli-core';
 import { initConfig } from './initConfig.js';
 import type {
@@ -31,6 +39,46 @@ import type {
   SessionUpdate,
 } from './types.js';
 
+type RpcRequestSender = (method: string, params?: unknown) => Promise<unknown>;
+
+type PermissionOption = {
+  optionId: string;
+  name: string;
+  kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always';
+};
+
+type PermissionRequest = {
+  sessionId: string;
+  options: PermissionOption[];
+  toolCall: {
+    toolCallId: string;
+    rawInput?: Record<string, unknown>;
+    status?: string;
+    title?: string;
+    kind?: string;
+    content?: ToolCallContent[];
+    locations?: Array<{ path: string }>;
+  };
+};
+
+type PermissionResponse = {
+  outcome?: {
+    optionId?: string;
+  };
+  optionId?: string;
+};
+
+type ToolCallContent = {
+  type: 'content' | 'diff';
+  content?: {
+    type: 'text';
+    text: string;
+  };
+  path?: string;
+  oldText?: string | null;
+  newText?: string;
+};
+
 interface SessionState {
   id: string;
   workingDirectory: string;
@@ -39,16 +87,27 @@ interface SessionState {
   storage: Storage;
   logger: Logger;
   abortController: AbortController;
+  toolScheduler: CoreToolScheduler;
+  pendingPermissionRequests: Set<string>;
+  toolCallCompletion: {
+    resolve: (responseParts: Part[]) => void;
+    reject: (error: Error) => void;
+  } | null;
 }
 
 export class SessionManager {
   private sessions = new Map<string, SessionState>();
+  private rpcRequestSender: RpcRequestSender | null = null;
 
   // Event callbacks (wired by server.ts)
   onStreamEvent:
     | ((sessionId: string, event: SessionUpdate['update']) => void)
     | null = null;
   onTurnComplete: ((sessionId: string) => void) | null = null;
+
+  setRpcRequestSender(sender: RpcRequestSender): void {
+    this.rpcRequestSender = sender;
+  }
 
   /**
    * Create a new chat session with real LLM capabilities
@@ -68,6 +127,17 @@ export class SessionManager {
     const logger = new Logger(sessionId, storage);
     await logger.initialize();
 
+    const toolScheduler = new CoreToolScheduler({
+      config,
+      getPreferredEditor: () => undefined,
+      onToolCallsUpdate: (toolCalls) => {
+        this.handleToolCallsUpdate(sessionId, toolCalls);
+      },
+      onAllToolCallsComplete: async (completedToolCalls) => {
+        await this.handleToolCallsComplete(sessionId, completedToolCalls);
+      },
+    });
+
     const session: SessionState = {
       id: sessionId,
       workingDirectory: cwd,
@@ -76,6 +146,9 @@ export class SessionManager {
       storage,
       logger,
       abortController: new AbortController(),
+      toolScheduler,
+      pendingPermissionRequests: new Set(),
+      toolCallCompletion: null,
     };
 
     this.sessions.set(sessionId, session);
@@ -84,61 +157,107 @@ export class SessionManager {
   }
 
   /**
+   * Get the Config object for a session
+   */
+  getConfig(sessionId: string): Config | undefined {
+    return this.sessions.get(sessionId)?.config;
+  }
+
+  /**
    * Send a prompt to the session using real GeminiChat
    */
   async sendPrompt(sessionId: string, prompt: string): Promise<void> {
     const session = this.getSession(sessionId);
     const promptId = `${sessionId}-${Date.now()}`;
-
-    // Emit user message
-    this.emitStreamEvent(sessionId, {
-      sessionUpdate: 'agent_message_chunk',
-      role: 'user',
-      content: prompt,
-    });
+    let requestParts: Part[] = [{ text: prompt }];
 
     try {
-      // Use GeminiClient.sendMessageStream for real LLM call
-      const responseStream = session.geminiClient.sendMessageStream(
-        [{ text: prompt }],
-        session.abortController.signal,
-        promptId,
-      );
+      while (true) {
+        const responseStream = session.geminiClient.sendMessageStream(
+          requestParts,
+          session.abortController.signal,
+          promptId,
+        );
 
-      let fullResponse = '';
+        let fullResponse = '';
+        const toolCallRequests: ToolCallRequestInfo[] = [];
 
-      for await (const event of responseStream) {
-        if (event.type === GeminiEventType.Content) {
-          const text = event.value;
-          if (text) {
-            fullResponse += text;
-            // Stream the chunk
-            this.emitStreamEvent(sessionId, {
-              sessionUpdate: 'agent_message_chunk',
-              role: 'model',
-              content: text,
-            });
+        for await (const event of responseStream) {
+          switch (event.type) {
+            case GeminiEventType.Content: {
+              const text = event.value;
+              if (text) {
+                fullResponse += text;
+                this.emitStreamEvent(sessionId, {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: {
+                    type: 'text',
+                    text,
+                  },
+                });
+              }
+              break;
+            }
+            case GeminiEventType.Thought: {
+              const subject = event.value?.subject || '';
+              const description = event.value?.description || '';
+              const thoughtText = subject
+                ? `**${subject}**\n${description}`.trim()
+                : description;
+              if (thoughtText) {
+                this.emitStreamEvent(sessionId, {
+                  sessionUpdate: 'agent_thought_chunk',
+                  content: {
+                    type: 'text',
+                    text: thoughtText,
+                  },
+                });
+              }
+              break;
+            }
+            case GeminiEventType.ToolCallRequest: {
+              toolCallRequests.push(event.value);
+              break;
+            }
+            case GeminiEventType.Error: {
+              const errorMessage =
+                event.value?.error?.message ?? 'Unknown error';
+              this.emitStreamEvent(sessionId, {
+                sessionUpdate: 'agent_message_chunk',
+                content: {
+                  type: 'text',
+                  text: `[Error: ${errorMessage}]`,
+                },
+              });
+              break;
+            }
+            default:
+              break;
           }
-        } else if (event.type === GeminiEventType.Error) {
-          const errorMessage = event.value?.error?.message ?? 'Unknown error';
-          this.emitStreamEvent(sessionId, {
-            sessionUpdate: 'agent_message_chunk',
-            role: 'model',
-            content: `[Error: ${errorMessage}]`,
-          });
-          break;
-        } else if (event.type === GeminiEventType.ToolCallRequest) {
-          // Handle tool calls if needed
-          debugLogger.log(
-            `[SessionManager] Tool call requested: ${event.value?.name}`,
-          );
-          // For now, we don't auto-execute tools in custom-agent
         }
-      }
 
-      debugLogger.log(
-        `[SessionManager] Response complete: ${fullResponse.length} chars`,
-      );
+        debugLogger.log(
+          `[SessionManager] Response complete: ${fullResponse.length} chars`,
+        );
+
+        if (toolCallRequests.length === 0) {
+          break;
+        }
+
+        debugLogger.log(
+          `[SessionManager] Executing ${toolCallRequests.length} tool call(s)`,
+        );
+        const toolResponses = await this.executeToolCalls(
+          sessionId,
+          toolCallRequests,
+          session.abortController.signal,
+        );
+        if (toolResponses.length === 0) {
+          break;
+        }
+
+        requestParts = toolResponses;
+      }
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -147,15 +266,292 @@ export class SessionManager {
       );
       this.emitStreamEvent(sessionId, {
         sessionUpdate: 'agent_message_chunk',
-        role: 'model',
-        content: `[Error: ${errorMessage}]`,
+        content: {
+          type: 'text',
+          text: `[Error: ${errorMessage}]`,
+        },
       });
     }
 
-    // Signal turn complete
     if (this.onTurnComplete) {
       this.onTurnComplete(sessionId);
     }
+  }
+
+  private async executeToolCalls(
+    sessionId: string,
+    toolCallRequests: ToolCallRequestInfo[],
+    signal: AbortSignal,
+  ): Promise<Part[]> {
+    const session = this.getSession(sessionId);
+    return new Promise<Part[]>((resolve, reject) => {
+      session.toolCallCompletion = { resolve, reject };
+      session.toolScheduler
+        .schedule(toolCallRequests, signal)
+        .catch((error) => {
+          session.toolCallCompletion = null;
+          reject(error instanceof Error ? error : new Error(String(error)));
+        });
+    });
+  }
+
+  private handleToolCallsUpdate(
+    sessionId: string,
+    toolCalls: ToolCall[],
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    for (const call of toolCalls) {
+      this.emitStreamEvent(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: call.request.callId,
+        status: this.mapToolStatus(call.status),
+        title: this.getToolTitle(call),
+        kind: this.mapToolKind(call.tool?.kind),
+        rawInput: this.buildRawInput(call),
+        content: this.buildToolCallContent(call),
+        locations: this.buildLocations(call.request.args),
+      });
+
+      if (call.status === 'awaiting_approval') {
+        if (!session.pendingPermissionRequests.has(call.request.callId)) {
+          session.pendingPermissionRequests.add(call.request.callId);
+          void this.requestToolApproval(sessionId, call);
+        }
+      } else {
+        session.pendingPermissionRequests.delete(call.request.callId);
+      }
+    }
+  }
+
+  private async handleToolCallsComplete(
+    sessionId: string,
+    completedToolCalls: CompletedToolCall[],
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    const responseParts: Part[] = [];
+
+    for (const call of completedToolCalls) {
+      if (call.response?.responseParts) {
+        responseParts.push(...call.response.responseParts);
+      }
+
+      const status = call.status === 'success' ? 'completed' : 'failed';
+      const resultText = this.formatToolResult(call);
+      const content =
+        resultText.length > 0
+          ? [
+              {
+                type: 'content',
+                content: { type: 'text', text: resultText },
+              },
+            ]
+          : undefined;
+
+      this.emitStreamEvent(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: call.request.callId,
+        status,
+        content,
+      });
+
+      session.pendingPermissionRequests.delete(call.request.callId);
+    }
+
+    if (session.toolCallCompletion) {
+      session.toolCallCompletion.resolve(responseParts);
+      session.toolCallCompletion = null;
+    }
+  }
+
+  private async requestToolApproval(
+    sessionId: string,
+    call: WaitingToolCall,
+  ): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    if (!this.rpcRequestSender) {
+      await call.confirmationDetails.onConfirm(ToolConfirmationOutcome.Cancel);
+      return;
+    }
+
+    const permissionRequest: PermissionRequest = {
+      sessionId,
+      options: [
+        { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+        {
+          optionId: 'allow_always',
+          name: 'Allow always',
+          kind: 'allow_always',
+        },
+        { optionId: 'reject_once', name: 'Reject once', kind: 'reject_once' },
+        {
+          optionId: 'reject_always',
+          name: 'Reject always',
+          kind: 'reject_always',
+        },
+      ],
+      toolCall: {
+        toolCallId: call.request.callId,
+        rawInput: this.buildRawInput(call),
+        status: this.mapToolStatus(call.status),
+        title: this.getToolTitle(call),
+        kind: this.mapToolKind(call.tool?.kind),
+        content: this.buildToolCallContent(call),
+        locations: this.buildLocations(call.request.args),
+      },
+    };
+
+    try {
+      const response = (await this.rpcRequestSender(
+        'session/request_permission',
+        permissionRequest,
+      )) as PermissionResponse;
+      const optionId = response?.outcome?.optionId ?? response?.optionId;
+      const outcome = this.mapOptionIdToOutcome(optionId);
+      await call.confirmationDetails.onConfirm(outcome);
+    } catch (error) {
+      debugLogger.warn(
+        `[SessionManager] Permission request failed: ${String(error)}`,
+      );
+      await call.confirmationDetails.onConfirm(ToolConfirmationOutcome.Cancel);
+    } finally {
+      session.pendingPermissionRequests.delete(call.request.callId);
+    }
+  }
+
+  private mapOptionIdToOutcome(optionId?: string): ToolConfirmationOutcome {
+    switch (optionId) {
+      case 'allow_always':
+        return ToolConfirmationOutcome.ProceedAlways;
+      case 'allow_once':
+        return ToolConfirmationOutcome.ProceedOnce;
+      default:
+        return ToolConfirmationOutcome.Cancel;
+    }
+  }
+
+  private mapToolStatus(
+    status: ToolCall['status'],
+  ): 'pending' | 'in_progress' | 'completed' | 'failed' {
+    switch (status) {
+      case 'executing':
+        return 'in_progress';
+      case 'success':
+        return 'completed';
+      case 'error':
+      case 'cancelled':
+        return 'failed';
+      default:
+        return 'pending';
+    }
+  }
+
+  private mapToolKind(kind?: Kind): 'read' | 'edit' | 'execute' {
+    switch (kind) {
+      case Kind.Read:
+      case Kind.Search:
+      case Kind.Fetch:
+        return 'read';
+      case Kind.Edit:
+      case Kind.Delete:
+      case Kind.Move:
+        return 'edit';
+      default:
+        return 'execute';
+    }
+  }
+
+  private getToolTitle(call: ToolCall): string {
+    if (
+      call.status === 'awaiting_approval' &&
+      'confirmationDetails' in call &&
+      call.confirmationDetails?.title
+    ) {
+      return call.confirmationDetails.title;
+    }
+    return call.tool?.displayName ?? call.request.name;
+  }
+
+  private buildRawInput(call: ToolCall): Record<string, unknown> | undefined {
+    const args = call.request.args || {};
+    if (
+      call.request.name === SHELL_TOOL_NAME &&
+      typeof args['command'] === 'string'
+    ) {
+      const rawInput: Record<string, unknown> = {
+        command: args['command'],
+      };
+      if (typeof args['description'] === 'string') {
+        rawInput['description'] = args['description'];
+      }
+      return rawInput;
+    }
+    return Object.keys(args).length > 0 ? args : undefined;
+  }
+
+  private buildLocations(
+    args: Record<string, unknown>,
+  ): Array<{ path: string }> | undefined {
+    const pathCandidate =
+      (typeof args['file_path'] === 'string' && args['file_path']) ||
+      (typeof args['path'] === 'string' && args['path']) ||
+      (typeof args['dir_path'] === 'string' && args['dir_path']);
+
+    if (!pathCandidate) {
+      return undefined;
+    }
+
+    return [{ path: pathCandidate }];
+  }
+
+  private buildToolCallContent(call: ToolCall): ToolCallContent[] | undefined {
+    if (call.status !== 'awaiting_approval') {
+      return undefined;
+    }
+
+    const waitingCall = call;
+    if (waitingCall.confirmationDetails?.type !== 'edit') {
+      return undefined;
+    }
+
+    const details = waitingCall.confirmationDetails;
+    return [
+      {
+        type: 'diff',
+        path: details.filePath || details.fileName || '',
+        oldText: details.originalContent ?? '',
+        newText: details.newContent ?? '',
+      },
+    ];
+  }
+
+  private formatToolResult(call: CompletedToolCall): string {
+    const resultDisplay = call.response?.resultDisplay;
+    if (typeof resultDisplay === 'string') {
+      return resultDisplay;
+    }
+    if (resultDisplay !== undefined) {
+      try {
+        return JSON.stringify(resultDisplay, null, 2);
+      } catch {
+        return String(resultDisplay);
+      }
+    }
+    if (call.response?.error) {
+      return call.response.error.message;
+    }
+    return '';
   }
 
   /**
@@ -348,6 +744,27 @@ export class SessionManager {
       return { saves };
     } catch {
       return { saves: [] };
+    }
+  }
+
+  /**
+   * Check if a checkpoint with the given name already exists
+   */
+  async saveExists(saveName: string): Promise<boolean> {
+    const storage =
+      this.sessions.size > 0
+        ? Array.from(this.sessions.values())[0].storage
+        : new Storage(process.cwd());
+
+    const checkpointsDir = storage.getProjectTempDir();
+    const filePath = path.join(checkpointsDir, `checkpoint-${saveName}.json`);
+
+    try {
+      const fs = await import('node:fs/promises');
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
     }
   }
 

@@ -16,6 +16,14 @@ import type {
 } from './types.js';
 
 const server = new CustomAgentServer();
+let nextRequestId = 0;
+const pendingRequests = new Map<
+  number,
+  {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+  }
+>();
 
 // JSON-RPC over stdin/stdout
 const rl = readline.createInterface({
@@ -38,21 +46,35 @@ function sendNotification(notification: JsonRpcNotification): void {
   process.stdout.write(JSON.stringify(notification) + '\n');
 }
 
+function sendRequest(method: string, params?: unknown): Promise<unknown> {
+  const id = nextRequestId++;
+  const request = {
+    jsonrpc: '2.0',
+    id,
+    method,
+    ...(params !== undefined ? { params } : {}),
+  };
+
+  process.stdout.write(JSON.stringify(request) + '\n');
+
+  return new Promise((resolve, reject) => {
+    pendingRequests.set(id, { resolve, reject });
+  });
+}
+
+server.setRpcRequestSender(sendRequest);
+
 // Wire up server events to notifications
 server.onSessionUpdate = (update) => {
   sendNotification({
     jsonrpc: '2.0',
-    method: 'notifications/sessionUpdate',
+    method: 'session/update',
     params: update,
   });
 };
 
 server.onEndTurn = () => {
-  sendNotification({
-    jsonrpc: '2.0',
-    method: 'notifications/endTurn',
-    params: {},
-  });
+  // End-turn is reported in the sendPrompt response (stopReason)
 };
 
 /**
@@ -78,23 +100,61 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
   }
 }
 
+async function handleNotification(
+  notification: JsonRpcNotification,
+): Promise<void> {
+  try {
+    await server.handleMethod(notification.method, notification.params);
+  } catch {
+    // Ignore notification errors
+  }
+}
+
+function handleResponse(message: JsonRpcResponse): void {
+  if (typeof message.id !== 'number') {
+    return;
+  }
+  const pending = pendingRequests.get(message.id);
+  if (!pending) {
+    return;
+  }
+  pendingRequests.delete(message.id);
+  if (message.error) {
+    pending.reject(new Error(message.error.message));
+  } else {
+    pending.resolve(message.result);
+  }
+}
+
 // Process each line as a JSON-RPC message
 rl.on('line', (line) => {
   if (!line.trim()) return;
 
   try {
-    const message = JSON.parse(line) as JsonRpcRequest;
+    const message = JSON.parse(line) as JsonRpcRequest | JsonRpcResponse;
 
     if (message.jsonrpc !== '2.0') {
       sendResponse({
         jsonrpc: '2.0',
-        id: message.id ?? null,
+        id: 'id' in message ? (message.id ?? null) : null,
         error: { code: -32600, message: 'Invalid Request: not JSON-RPC 2.0' },
       });
       return;
     }
 
-    void handleRequest(message);
+    if ('method' in message) {
+      if ('id' in message && message.id !== undefined) {
+        void handleRequest(message);
+      } else {
+        void handleNotification(message as JsonRpcNotification);
+      }
+      return;
+    }
+
+    if ('id' in message) {
+      handleResponse(message);
+      return;
+    }
   } catch {
     sendResponse({
       jsonrpc: '2.0',

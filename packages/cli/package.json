@@ -9,6 +9,10 @@
   },
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./services": "./dist/src/exports.js"
+  },
   "bin": {
     "gemini": "dist/index.js"
   },

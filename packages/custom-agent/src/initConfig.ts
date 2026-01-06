@@ -36,6 +36,8 @@ export async function initConfig(
 ): Promise<Config> {
   debugLogger.log(`[initConfig] Initializing config for session ${sessionId}`);
 
+  const toolsEnabled = process.env['CUSTOM_AGENT_ENABLE_TOOLS'] !== 'false';
+
   const configParams: ConfigParameters = {
     sessionId,
     model: DEFAULT_GEMINI_MODEL,
@@ -50,9 +52,15 @@ export async function initConfig(
       respectGitIgnore: true,
       enableRecursiveFileSearch: true,
     },
-    interactive: false, // Non-interactive mode for RPC server
+    interactive: toolsEnabled, // Enable confirmations when tools are active
     checkpointing: true, // Enable checkpointing for save/resume
   };
+
+  if (!toolsEnabled) {
+    // Avoid tool-call-only responses in non-interactive ACP mode.
+    configParams.coreTools = [];
+    configParams.enabledExtensions = [];
+  }
 
   // Load memory files (GEMINI.md etc)
   const extensionLoader = new SimpleExtensionLoader([]);

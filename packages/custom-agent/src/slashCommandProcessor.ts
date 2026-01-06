@@ -8,16 +8,16 @@
  * Slash Command Processor
  *
  * Parses and routes slash commands like /chat save, /chat resume, /copy, etc.
- * Also dynamically loads and routes extension commands (e.g., /conductor:status).
+ * Uses FileCommandLoader from CLI for extension commands (conductor, etc.)
  */
 
 import type { SessionManager } from './sessionManager.js';
-import { debugLogger } from '@google/gemini-cli-core';
+import { debugLogger, type Config } from '@google/gemini-cli-core';
 import {
-  getExtensionCommand,
-  loadAllCommands,
-  type ExtensionCommand,
-} from './extensionCommandLoader.js';
+  FileCommandLoader,
+  type SlashCommand,
+  type CommandContext,
+} from '@google/gemini-cli/services';
 
 /**
  * Result of a slash command execution
@@ -28,7 +28,7 @@ export interface SlashCommandResult {
   /** Response message to display to the user */
   message?: string;
   /** Type of response for UI styling */
-  type?: 'info' | 'error' | 'success';
+  type?: 'info' | 'error' | 'success' | 'confirm';
   /** For list commands, structured data */
   data?: unknown;
   /** For extension commands, the prompt to send to the LLM */
@@ -45,6 +45,49 @@ interface ParsedCommand {
   subcommand?: string;
   /** Arguments after the command */
   args: string;
+  /** Raw input */
+  raw: string;
+}
+
+/**
+ * Cache for loaded file commands
+ */
+let fileCommandCache: SlashCommand[] | null = null;
+let cacheConfig: Config | null = null;
+
+/**
+ * Load file commands using FileCommandLoader from CLI
+ */
+async function loadFileCommands(
+  config: Config | null,
+): Promise<SlashCommand[]> {
+  // Return cached if same config
+  if (fileCommandCache && cacheConfig === config) {
+    return fileCommandCache;
+  }
+
+  const loader = new FileCommandLoader(config);
+  const controller = new AbortController();
+
+  try {
+    fileCommandCache = await loader.loadCommands(controller.signal);
+    cacheConfig = config;
+    debugLogger.log(
+      `[SlashCommand] Loaded ${fileCommandCache.length} file commands`,
+    );
+    return fileCommandCache;
+  } catch (error) {
+    debugLogger.warn(`[SlashCommand] Failed to load file commands: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Clear the command cache (call when config changes)
+ */
+export function clearCommandCache(): void {
+  fileCommandCache = null;
+  cacheConfig = null;
 }
 
 /**
@@ -70,6 +113,7 @@ export function parseSlashCommand(input: string): ParsedCommand | null {
       command,
       subcommand: colonSubcommand,
       args: rest,
+      raw: trimmed,
     };
   }
 
@@ -82,6 +126,7 @@ export function parseSlashCommand(input: string): ParsedCommand | null {
     command,
     subcommand,
     args,
+    raw: trimmed,
   };
 }
 
@@ -92,6 +137,7 @@ export async function processSlashCommand(
   input: string,
   sessionId: string,
   sessionManager: SessionManager,
+  config?: Config | null,
 ): Promise<SlashCommandResult> {
   const parsed = parseSlashCommand(input);
 
@@ -117,22 +163,26 @@ export async function processSlashCommand(
       return processCopyCommand(sessionId, sessionManager);
 
     case 'help':
-      return processHelpCommand();
+      return processHelpCommand(config ?? null);
+
+    case 'auth':
+      return processAuthCommand(parsed.subcommand, sessionManager);
 
     default:
-      // Fall through to extension command check below
+      // Fall through to file command check below
       break;
   }
 
-  // Check for extension commands (e.g., /conductor:status → "conductor:status")
-  const extensionCommandName = parsed.subcommand
+  // Check for file-based commands (extensions, user commands)
+  const commandName = parsed.subcommand
     ? `${parsed.command}:${parsed.subcommand}`
     : parsed.command;
 
-  const extensionCommand = await getExtensionCommand(extensionCommandName);
+  const fileCommands = await loadFileCommands(config ?? null);
+  const fileCommand = fileCommands.find((c) => c.name === commandName);
 
-  if (extensionCommand) {
-    return processExtensionCommand(extensionCommand, parsed.args);
+  if (fileCommand && fileCommand.action) {
+    return processFileCommand(fileCommand, parsed);
   }
 
   return {
@@ -143,27 +193,192 @@ export async function processSlashCommand(
 }
 
 /**
- * Process an extension command
+ * Process a file-based command (extension command)
  */
-async function processExtensionCommand(
-  command: ExtensionCommand,
-  args: string,
+async function processFileCommand(
+  command: SlashCommand,
+  parsed: ParsedCommand,
 ): Promise<SlashCommandResult> {
-  // Replace {{args}} placeholder if present
-  let prompt = command.prompt;
-  if (prompt.includes('{{args}}')) {
-    prompt = prompt.replace(/\{\{args\}\}/g, args);
-  } else if (args) {
-    // Append args if no placeholder
-    prompt = `${prompt}\n\nUser input: ${args}`;
+  // Create minimal CommandContext for the action
+  const minimalContext: CommandContext = {
+    invocation: {
+      raw: parsed.raw,
+      name: command.name,
+      args: parsed.args,
+    },
+    // These are required but not used for simple file commands
+    services: {
+      config: null,
+      settings: {} as never,
+      git: undefined,
+      logger: {} as never,
+    },
+    ui: {} as never,
+    session: {
+      stats: {} as never,
+      sessionShellAllowlist: new Set(),
+    },
+  };
+
+  try {
+    const result = await command.action!(minimalContext, parsed.args);
+
+    // Handle submit_prompt result (most common for file commands)
+    if (result && typeof result === 'object' && 'type' in result) {
+      if (result.type === 'submit_prompt' && 'content' in result) {
+        // Extract text from content array
+        const content = result.content as Array<{ text?: string }>;
+        const prompt = content
+          .filter((p) => p.text)
+          .map((p) => p.text)
+          .join('\n');
+
+        return {
+          handled: true,
+          type: 'info',
+          message: `Running /${command.name}...`,
+          promptToSend: prompt,
+        };
+      }
+
+      if (result.type === 'confirm_shell_commands') {
+        // Shell confirmation required - not fully supported yet
+        return {
+          handled: true,
+          type: 'error',
+          message: `Command /${command.name} requires shell confirmation, which is not yet supported.`,
+        };
+      }
+    }
+
+    return {
+      handled: true,
+      type: 'info',
+      message: `Executed /${command.name}`,
+    };
+  } catch (error) {
+    return {
+      handled: true,
+      type: 'error',
+      message: `Failed to execute /${command.name}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+/**
+ * Process /auth command
+ * Handles authentication status and login flow
+ */
+async function processAuthCommand(
+  subcommand: string | undefined,
+  _sessionManager: SessionManager,
+): Promise<SlashCommandResult> {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  const credentialsPath = path.join(
+    os.homedir(),
+    '.gemini',
+    'oauth_creds.json',
+  );
+  const apiKeySet = !!process.env['GEMINI_API_KEY'];
+
+  // Check current auth status
+  let hasOAuthCreds = false;
+  try {
+    await fs.access(credentialsPath);
+    hasOAuthCreds = true;
+  } catch {
+    hasOAuthCreds = false;
   }
 
-  return {
-    handled: true,
-    type: 'info',
-    message: `Running ${command.name}...`,
-    promptToSend: prompt,
-  };
+  switch (subcommand) {
+    case 'status':
+    case undefined: {
+      // Show auth status
+      const statusParts: string[] = [];
+
+      if (apiKeySet) {
+        statusParts.push('✅ GEMINI_API_KEY is set');
+      } else {
+        statusParts.push('❌ GEMINI_API_KEY is not set');
+      }
+
+      if (hasOAuthCreds) {
+        statusParts.push(
+          '✅ OAuth credentials found at ~/.gemini/oauth_creds.json',
+        );
+      } else {
+        statusParts.push('❌ No OAuth credentials found');
+      }
+
+      if (!apiKeySet && !hasOAuthCreds) {
+        statusParts.push('');
+        statusParts.push('To authenticate, either:');
+        statusParts.push(
+          '1. Set GEMINI_API_KEY in your .env file or environment',
+        );
+        statusParts.push('2. Run `/auth login` to authenticate via OAuth');
+      }
+
+      return {
+        handled: true,
+        type: apiKeySet || hasOAuthCreds ? 'success' : 'info',
+        message: statusParts.join('\n'),
+      };
+    }
+
+    case 'login': {
+      // The OAuth flow needs to be handled by the CLI
+      // Return a special result that tells the frontend to open the auth URL
+      const authUrl = 'https://aistudio.google.com/apikey';
+
+      return {
+        handled: true,
+        type: 'info',
+        message: `To authenticate with Gemini:\n\n1. Get an API key from: ${authUrl}\n2. Add it to your AionUi/.env file:\n   GEMINI_API_KEY=your_key_here\n3. Restart the backend\n\nAlternatively, run 'gemini auth login' in your terminal.`,
+        data: {
+          action: 'open_url',
+          url: authUrl,
+        },
+      };
+    }
+
+    case 'logout': {
+      // Remove credentials
+      if (hasOAuthCreds) {
+        try {
+          await fs.unlink(credentialsPath);
+          return {
+            handled: true,
+            type: 'success',
+            message:
+              'OAuth credentials removed. Note: GEMINI_API_KEY environment variable is still set if configured.',
+          };
+        } catch (error) {
+          return {
+            handled: true,
+            type: 'error',
+            message: `Failed to remove credentials: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      } else {
+        return {
+          handled: true,
+          type: 'info',
+          message: 'No OAuth credentials to remove.',
+        };
+      }
+    }
+
+    default:
+      return {
+        handled: true,
+        type: 'error',
+        message: 'Usage: /auth [status|login|logout]',
+      };
+  }
 }
 
 /**
@@ -177,27 +392,51 @@ async function processChatCommand(
 ): Promise<SlashCommandResult> {
   switch (subcommand) {
     case 'save': {
-      if (!args.trim()) {
+      // Parse args - support --force or -f flag to skip confirmation
+      const parts = args.trim().split(/\s+/);
+      const forceFlag = parts.some((p) => p === '--force' || p === '-f');
+      const saveName = parts
+        .filter((p) => p !== '--force' && p !== '-f')
+        .join(' ')
+        .trim();
+
+      if (!saveName) {
         return {
           handled: true,
           type: 'error',
-          message: 'Usage: /chat save <name>',
+          message: 'Usage: /chat save <name> [--force]',
         };
       }
 
       try {
+        // Check if save already exists (unless force flag is set)
+        if (!forceFlag) {
+          const exists = await sessionManager.saveExists(saveName);
+          if (exists) {
+            return {
+              handled: true,
+              type: 'confirm',
+              message: `A checkpoint named "${saveName}" already exists. Overwrite?`,
+              data: {
+                confirmAction: 'save_overwrite',
+                saveName,
+              },
+            };
+          }
+        }
+
         const historyLength = sessionManager.getHistoryLength(sessionId);
         const lastMessageIndex = historyLength > 0 ? historyLength - 1 : 0;
         const result = await sessionManager.saveFromPoint(
           sessionId,
           lastMessageIndex,
-          args.trim(),
+          saveName,
         );
 
         return {
           handled: true,
           type: 'success',
-          message: `Checkpoint saved: ${args.trim()}`,
+          message: `Checkpoint saved: ${saveName}`,
           data: result,
         };
       } catch (error) {
@@ -358,9 +597,11 @@ async function processCopyCommand(
 /**
  * Process /help command
  */
-async function processHelpCommand(): Promise<SlashCommandResult> {
-  // Load available extension commands dynamically
-  const extensionCommands = await loadAllCommands();
+async function processHelpCommand(
+  config: Config | null,
+): Promise<SlashCommandResult> {
+  // Load file commands dynamically
+  const fileCommands = await loadFileCommands(config);
 
   const builtInHelp = `
 Available commands:
@@ -372,9 +613,10 @@ Available commands:
   /help                - Show this help message
 `.trim();
 
-  // Group extension commands by extension name
-  const extensionsByName = new Map<string, ExtensionCommand[]>();
-  for (const cmd of extensionCommands) {
+  // Group file commands by extension name
+  const extensionsByName = new Map<string, SlashCommand[]>();
+  for (const cmd of fileCommands) {
+    if (cmd.hidden) continue;
     const ext = cmd.extensionName || 'user';
     if (!extensionsByName.has(ext)) {
       extensionsByName.set(ext, []);
@@ -416,18 +658,147 @@ Available commands:
 /**
  * Get available slash commands for autocomplete
  */
-export async function getAvailableCommands(): Promise<string[]> {
-  const builtIn = [
-    '/chat save',
-    '/chat resume',
-    '/chat list',
-    '/chat delete',
-    '/copy',
-    '/help',
+export async function getAvailableCommands(
+  config: Config | null,
+): Promise<SlashCommand[]> {
+  const builtIn: SlashCommand[] = [
+    {
+      name: 'chat save',
+      description: 'Save the current conversation',
+      kind: 0 as never,
+    },
+    {
+      name: 'chat resume',
+      description: 'Resume a saved conversation',
+      kind: 0 as never,
+    },
+    {
+      name: 'chat list',
+      description: 'List saved checkpoints',
+      kind: 0 as never,
+    },
+    {
+      name: 'chat delete',
+      description: 'Delete a saved checkpoint',
+      kind: 0 as never,
+    },
+    {
+      name: 'copy',
+      description: 'Copy last response to clipboard',
+      kind: 0 as never,
+    },
+    { name: 'help', description: 'Show available commands', kind: 0 as never },
   ];
 
-  const extensionCommands = await loadAllCommands();
-  const extensionNames = extensionCommands.map((c) => `/${c.name}`);
+  const fileCommands = await loadFileCommands(config);
+  return [...builtIn, ...fileCommands];
+}
 
-  return [...builtIn, ...extensionNames];
+/**
+ * Completion item for autocomplete
+ */
+export interface CompletionItem {
+  /** Text to insert (e.g., "/chat save" or "my-checkpoint") */
+  text: string;
+  /** Display name in the dropdown */
+  displayName: string;
+  /** Description for the item */
+  description: string;
+  /** Category (command, argument, extension) */
+  category: string;
+  /** Whether this is an argument completion (vs command completion) */
+  isArgument?: boolean;
+}
+
+/**
+ * Get completions for the given input
+ * Supports both command name completion and argument completion
+ */
+export async function getCompletions(
+  input: string,
+  sessionManager: SessionManager,
+  config: Config | null,
+): Promise<CompletionItem[]> {
+  const trimmed = input.trim();
+
+  // Must start with /
+  if (!trimmed.startsWith('/')) {
+    return [];
+  }
+
+  // Check if we're completing arguments (command is complete, now typing args)
+  const argCompletions = await getArgumentCompletions(
+    trimmed,
+    sessionManager,
+    config,
+  );
+  if (argCompletions.length > 0) {
+    return argCompletions;
+  }
+
+  // Otherwise, return command name completions
+  const commands = await getAvailableCommands(config);
+  const lowerInput = trimmed.toLowerCase();
+
+  return commands
+    .filter((cmd) => `/${cmd.name}`.toLowerCase().startsWith(lowerInput))
+    .map((cmd) => ({
+      text: `/${cmd.name}`,
+      displayName: `/${cmd.name}`,
+      description: cmd.description,
+      category: cmd.extensionName || 'built-in',
+      isArgument: false,
+    }));
+}
+
+/**
+ * Get argument completions for commands that support them
+ */
+async function getArgumentCompletions(
+  input: string,
+  sessionManager: SessionManager,
+  _config: Config | null,
+): Promise<CompletionItem[]> {
+  // Check for /chat resume completion
+  const chatResumeMatch = input.match(/^\/chat\s+resume\s+(.*)/i);
+  if (chatResumeMatch) {
+    const argPrefix = chatResumeMatch[1].toLowerCase();
+    try {
+      const { saves } = await sessionManager.listSaves();
+      return saves
+        .filter((s) => s.name.toLowerCase().startsWith(argPrefix))
+        .map((s) => ({
+          text: `/chat resume ${s.name}`,
+          displayName: s.name,
+          description: `${s.messageCount} messages`,
+          category: 'save',
+          isArgument: true,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  // Check for /chat delete completion (same as resume)
+  const chatDeleteMatch = input.match(/^\/chat\s+delete\s+(.*)/i);
+  if (chatDeleteMatch) {
+    const argPrefix = chatDeleteMatch[1].toLowerCase();
+    try {
+      const { saves } = await sessionManager.listSaves();
+      return saves
+        .filter((s) => s.name.toLowerCase().startsWith(argPrefix))
+        .map((s) => ({
+          text: `/chat delete ${s.name}`,
+          displayName: s.name,
+          description: `${s.messageCount} messages`,
+          category: 'save',
+          isArgument: true,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  // No argument completion for this command
+  return [];
 }

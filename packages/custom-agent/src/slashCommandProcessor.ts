@@ -459,7 +459,11 @@ async function processChatCommand(
       }
 
       try {
-        const result = await sessionManager.resumeSession(args.trim());
+        const workingDirectory = sessionManager.getWorkingDirectory(sessionId);
+        const result = await sessionManager.resumeSession(
+          args.trim(),
+          workingDirectory,
+        );
         return {
           handled: true,
           type: 'success',

@@ -164,6 +164,13 @@ export class SessionManager {
   }
 
   /**
+   * Get the working directory for a session
+   */
+  getWorkingDirectory(sessionId: string): string {
+    return this.getSession(sessionId).workingDirectory;
+  }
+
+  /**
    * Send a prompt to the session using real GeminiChat
    */
   async sendPrompt(sessionId: string, prompt: string): Promise<void> {

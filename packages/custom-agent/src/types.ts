@@ -59,6 +59,7 @@ export interface InitializeResult {
 export interface NewSessionParams {
   workingDirectory?: string;
   cwd?: string;
+  conversationId?: string;
 }
 
 export interface NewSessionResult {
@@ -106,8 +107,10 @@ export interface SaveFromPointResult {
 }
 
 export interface ResumeParams {
+  sessionId?: string;
   saveName: string;
   workingDirectory?: string;
+  conversationId?: string;
 }
 
 export interface ResumeResult {
@@ -146,8 +149,28 @@ export interface HistorySnapshotUpdate {
     messages: Array<{
       role: 'user' | 'model';
       content: string;
+      toolCalls?: HistorySnapshotToolCall[];
+      timestamp?: number;
     }>;
   };
+}
+
+export interface HistorySnapshotToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  status:
+    | 'validating'
+    | 'scheduled'
+    | 'executing'
+    | 'success'
+    | 'error'
+    | 'cancelled'
+    | 'awaiting_approval';
+  displayName?: string;
+  description?: string;
+  resultDisplay?: string;
+  renderOutputAsMarkdown?: boolean;
 }
 
 // Command types for autocomplete

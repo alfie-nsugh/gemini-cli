@@ -463,6 +463,8 @@ async function processChatCommand(
         const result = await sessionManager.resumeSession(
           args.trim(),
           workingDirectory,
+          sessionId,
+          sessionManager.getConversationId(sessionId),
         );
         return {
           handled: true,

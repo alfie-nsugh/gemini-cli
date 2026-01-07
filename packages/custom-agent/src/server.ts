@@ -11,6 +11,7 @@
  * Uses gemini-cli-core's GeminiChat for the underlying conversation management.
  */
 
+import { debugLogger } from '@google/gemini-cli-core';
 import type {
   InitializeParams,
   InitializeResult,
@@ -26,7 +27,6 @@ import type {
   ResumeResult,
   ListSavesResult,
   SessionUpdate,
-  HistorySnapshotUpdate,
   ListCommandsResult,
   CompleteCommandParams,
   CompleteCommandResult,
@@ -59,9 +59,7 @@ export class CustomAgentServer {
     };
 
     this.sessionManager.onTurnComplete = (_sessionId) => {
-      if (this.onEndTurn) {
-        this.onEndTurn();
-      }
+      void this.handleTurnComplete(_sessionId);
     };
   }
 
@@ -141,9 +139,29 @@ export class CustomAgentServer {
     if (!this.initialized) {
       throw new Error('Server not initialized. Call initialize first.');
     }
+    const workingDirectory = params.workingDirectory ?? params.cwd;
     const sessionId = await this.sessionManager.createSession(
-      params.workingDirectory ?? params.cwd,
+      workingDirectory,
+      params.conversationId,
     );
+
+    const autosaveTag = this.sessionManager.getAutosaveTagForConversation(
+      params.conversationId,
+    );
+    if (autosaveTag && (await this.sessionManager.saveExists(autosaveTag))) {
+      try {
+        await this.sessionManager.resumeSession(
+          autosaveTag,
+          workingDirectory,
+          sessionId,
+          params.conversationId,
+        );
+      } catch (error) {
+        debugLogger.warn(
+          `[CustomAgentServer] Autosave resume failed: ${String(error)}`,
+        );
+      }
+    }
     return { sessionId };
   }
 
@@ -272,24 +290,26 @@ export class CustomAgentServer {
     const result = await this.sessionManager.resumeSession(
       params.saveName,
       params.workingDirectory,
+      params.sessionId,
+      params.conversationId,
     );
-
-    // Send history snapshot to UI
-    if (this.onSessionUpdate) {
-      const snapshot: HistorySnapshotUpdate = {
-        sessionId: result.sessionId,
-        update: {
-          sessionUpdate: 'history_snapshot',
-          messages: result.messages,
-        },
-      };
-      this.onSessionUpdate(snapshot);
-    }
 
     return {
       sessionId: result.sessionId,
       messageCount: result.messages.length,
     };
+  }
+
+  private async handleTurnComplete(sessionId: string): Promise<void> {
+    try {
+      await this.sessionManager.autoSaveSession(sessionId);
+    } catch (error) {
+      debugLogger.warn(`[CustomAgentServer] Autosave failed: ${String(error)}`);
+    }
+
+    if (this.onEndTurn) {
+      this.onEndTurn();
+    }
   }
 
   /**

@@ -13,6 +13,7 @@
 
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { promises as fs } from 'node:fs';
 import type { Content, Part } from '@google/genai';
 import {
   type Config,
@@ -20,6 +21,9 @@ import {
   Storage,
   Logger,
   type Checkpoint,
+  type ConversationRecord,
+  type ResumedSessionData,
+  type ToolCallRecord,
   debugLogger,
   GeminiEventType,
   CoreToolScheduler,
@@ -30,10 +34,14 @@ import {
   ToolConfirmationOutcome,
   Kind,
   SHELL_TOOL_NAME,
+  INITIAL_HISTORY_LENGTH,
+  partListUnionToString,
+  encodeTagName,
 } from '@google/gemini-cli-core';
 import { initConfig } from './initConfig.js';
 import type {
   EditMessageResult,
+  HistorySnapshotToolCall,
   SaveFromPointResult,
   ListSavesResult,
   SessionUpdate,
@@ -79,9 +87,18 @@ type ToolCallContent = {
   newText?: string;
 };
 
+type CheckpointMetadata = {
+  version: 1;
+  savedAt: string;
+  conversationId?: string;
+  messageCount?: number;
+  recording?: ResumedSessionData;
+};
+
 interface SessionState {
   id: string;
   workingDirectory: string;
+  conversationId?: string;
   config: Config;
   geminiClient: GeminiClient;
   storage: Storage;
@@ -112,7 +129,10 @@ export class SessionManager {
   /**
    * Create a new chat session with real LLM capabilities
    */
-  async createSession(workingDirectory?: string): Promise<string> {
+  async createSession(
+    workingDirectory?: string,
+    conversationId?: string,
+  ): Promise<string> {
     const sessionId = crypto.randomUUID();
     const cwd = workingDirectory ?? process.cwd();
 
@@ -141,6 +161,7 @@ export class SessionManager {
     const session: SessionState = {
       id: sessionId,
       workingDirectory: cwd,
+      conversationId,
       config,
       geminiClient,
       storage,
@@ -168,6 +189,17 @@ export class SessionManager {
    */
   getWorkingDirectory(sessionId: string): string {
     return this.getSession(sessionId).workingDirectory;
+  }
+
+  /**
+   * Get the conversation ID for a session
+   */
+  getConversationId(sessionId: string): string | undefined {
+    return this.getSession(sessionId).conversationId;
+  }
+
+  getAutosaveTagForConversation(conversationId?: string): string | null {
+    return this.getAutosaveTag(conversationId);
   }
 
   /**
@@ -615,7 +647,10 @@ export class SessionManager {
         parts: [{ text: newContent }],
       });
 
-      const newSessionId = await this.createSession(session.workingDirectory);
+      const newSessionId = await this.createSession(
+        session.workingDirectory,
+        session.conversationId,
+      );
       const newSession = this.getSession(newSessionId);
       newSession.geminiClient.setHistory(newHistory);
 
@@ -660,10 +695,11 @@ export class SessionManager {
     };
 
     await session.logger.saveCheckpoint(checkpoint, saveName);
+    await this.saveCheckpointMetadata(session, saveName, historyToSave);
 
     const savePath = path.join(
       session.storage.getProjectTempDir(),
-      `checkpoint-${saveName}.json`,
+      `checkpoint-${encodeTagName(saveName)}.json`,
     );
 
     debugLogger.log(
@@ -678,13 +714,28 @@ export class SessionManager {
   async resumeSession(
     saveName: string,
     workingDirectory?: string,
+    providedSessionId?: string,
+    conversationId?: string,
   ): Promise<{
     sessionId: string;
-    messages: Array<{ role: 'user' | 'model'; content: string }>;
+    messages: Array<{
+      role: 'user' | 'model';
+      content: string;
+      toolCalls?: HistorySnapshotToolCall[];
+    }>;
   }> {
     const cwd = workingDirectory ?? process.cwd();
-    const sessionId = await this.createSession(cwd);
-    const session = this.getSession(sessionId);
+    let sessionId = providedSessionId;
+    let session: SessionState;
+    if (sessionId && this.sessions.has(sessionId)) {
+      session = this.getSession(sessionId);
+      if (conversationId && !session.conversationId) {
+        session.conversationId = conversationId;
+      }
+    } else {
+      sessionId = await this.createSession(cwd, conversationId);
+      session = this.getSession(sessionId);
+    }
 
     // Load checkpoint
     const checkpoint = await session.logger.loadCheckpoint(saveName);
@@ -693,13 +744,50 @@ export class SessionManager {
       throw new Error(`Save not found: ${saveName}`);
     }
 
-    // Resume the GeminiClient with loaded history
-    await session.geminiClient.resumeChat(checkpoint.history);
+    const metadata = await this.loadCheckpointMetadata(
+      session.storage,
+      saveName,
+    );
+    const recording = metadata?.recording;
+    const messageLimit =
+      metadata?.messageCount ??
+      Math.max(0, checkpoint.history.length - INITIAL_HISTORY_LENGTH);
 
-    const messages = checkpoint.history.map((content) => ({
-      role: content.role as 'user' | 'model',
-      content: content.parts?.map((p) => p.text ?? '').join('') ?? '',
-    }));
+    if (recording) {
+      const historyWithoutInitial = checkpoint.history.slice(
+        INITIAL_HISTORY_LENGTH,
+      );
+      await session.geminiClient.resumeChat(historyWithoutInitial, recording);
+    } else {
+      await session.geminiClient.resetChat();
+      session.geminiClient.setHistory(checkpoint.history);
+    }
+
+    const messages = recording?.conversation
+      ? this.buildHistorySnapshotFromConversation(
+          recording.conversation,
+          messageLimit,
+        )
+      : checkpoint.history.slice(INITIAL_HISTORY_LENGTH).reduce<
+          Array<{
+            role: 'user' | 'model';
+            content: string;
+            toolCalls?: HistorySnapshotToolCall[];
+          }>
+        >((acc, content) => {
+          const role = content.role === 'user' ? 'user' : 'model';
+          const text = this.formatHistoryParts(content.parts).trim();
+          if (text.length > 0) {
+            acc.push({ role, content: text });
+          }
+          return acc;
+        }, []);
+
+    // Emit restored messages to frontend so they appear in the chat window
+    this.emitStreamEvent(sessionId, {
+      sessionUpdate: 'history_snapshot',
+      messages,
+    });
 
     debugLogger.log(
       `[SessionManager] Resumed checkpoint "${saveName}" with ${messages.length} messages`,
@@ -729,6 +817,12 @@ export class SessionManager {
       for (const file of files) {
         if (!file.startsWith('checkpoint-') || !file.endsWith('.json'))
           continue;
+        if (
+          file.endsWith('.aionui.json') ||
+          file.endsWith('.aionui-recording.json')
+        ) {
+          continue;
+        }
 
         try {
           const filePath = path.join(checkpointsDir, file);
@@ -764,14 +858,25 @@ export class SessionManager {
         : new Storage(process.cwd());
 
     const checkpointsDir = storage.getProjectTempDir();
-    const filePath = path.join(checkpointsDir, `checkpoint-${saveName}.json`);
+    const encodedTag = encodeTagName(saveName);
+    const encodedPath = path.join(
+      checkpointsDir,
+      `checkpoint-${encodedTag}.json`,
+    );
+    const legacyPath = path.join(checkpointsDir, `checkpoint-${saveName}.json`);
 
     try {
       const fs = await import('node:fs/promises');
-      await fs.access(filePath);
+      await fs.access(encodedPath);
       return true;
     } catch {
-      return false;
+      try {
+        const fs = await import('node:fs/promises');
+        await fs.access(legacyPath);
+        return true;
+      } catch {
+        return false;
+      }
     }
   }
 
@@ -810,6 +915,236 @@ export class SessionManager {
   ): void {
     if (this.onStreamEvent) {
       this.onStreamEvent(sessionId, event);
+    }
+  }
+
+  private formatHistoryParts(parts?: Part[]): string {
+    if (!parts || parts.length === 0) {
+      return '';
+    }
+
+    return parts.map((part) => (part.text ? part.text : '')).join('');
+  }
+
+  private getAutosaveTag(conversationId?: string): string | null {
+    if (!conversationId) {
+      return null;
+    }
+    return `aionui-autosave-${conversationId}`;
+  }
+
+  private getCheckpointMetadataPath(storage: Storage, tag: string): string {
+    const encodedTag = encodeTagName(tag);
+    return path.join(
+      storage.getProjectTempDir(),
+      `checkpoint-${encodedTag}.aionui.json`,
+    );
+  }
+
+  private getCheckpointRecordingPath(storage: Storage, tag: string): string {
+    const encodedTag = encodeTagName(tag);
+    return path.join(
+      storage.getProjectTempDir(),
+      `checkpoint-${encodedTag}.aionui-recording.json`,
+    );
+  }
+
+  private async saveCheckpointMetadata(
+    session: SessionState,
+    saveName: string,
+    historyToSave: Content[],
+  ): Promise<void> {
+    try {
+      const metadataPath = this.getCheckpointMetadataPath(
+        session.storage,
+        saveName,
+      );
+      await fs.mkdir(path.dirname(metadataPath), { recursive: true });
+
+      const messageCount = Math.max(
+        0,
+        historyToSave.length - INITIAL_HISTORY_LENGTH,
+      );
+
+      let recording: ResumedSessionData | undefined;
+      const recordingService = session.geminiClient.getChatRecordingService();
+      const conversation = recordingService?.getConversation();
+      if (conversation) {
+        const trimmedConversation = this.trimConversationRecord(
+          conversation,
+          messageCount,
+        );
+        const recordingPath = this.getCheckpointRecordingPath(
+          session.storage,
+          saveName,
+        );
+        await fs.writeFile(
+          recordingPath,
+          JSON.stringify(trimmedConversation, null, 2),
+          'utf-8',
+        );
+        recording = {
+          conversation: trimmedConversation,
+          filePath: recordingPath,
+        };
+      }
+
+      const metadata: CheckpointMetadata = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        conversationId: session.conversationId,
+        messageCount,
+        ...(recording ? { recording } : {}),
+      };
+
+      await fs.writeFile(
+        metadataPath,
+        JSON.stringify(metadata, null, 2),
+        'utf-8',
+      );
+    } catch (error) {
+      debugLogger.warn(
+        `[SessionManager] Failed to write checkpoint metadata: ${String(error)}`,
+      );
+    }
+  }
+
+  private async loadCheckpointMetadata(
+    storage: Storage,
+    tag: string,
+  ): Promise<CheckpointMetadata | null> {
+    const primaryPath = this.getCheckpointMetadataPath(storage, tag);
+    const legacyPath = path.join(
+      storage.getProjectTempDir(),
+      `checkpoint-${tag}.aionui.json`,
+    );
+    const pathsToTry = [primaryPath, legacyPath];
+
+    for (const metadataPath of pathsToTry) {
+      try {
+        const raw = await fs.readFile(metadataPath, 'utf-8');
+        return JSON.parse(raw) as CheckpointMetadata;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue;
+        }
+        debugLogger.warn(
+          `[SessionManager] Failed to read checkpoint metadata: ${String(error)}`,
+        );
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  private trimConversationRecord(
+    conversation: ConversationRecord,
+    maxMessages: number,
+  ): ConversationRecord {
+    if (maxMessages <= 0) {
+      return { ...conversation, messages: [] };
+    }
+
+    let count = 0;
+    const trimmedMessages: ConversationRecord['messages'] = [];
+    for (const message of conversation.messages) {
+      if (message.type !== 'user' && message.type !== 'gemini') {
+        continue;
+      }
+      trimmedMessages.push(message);
+      count += 1;
+      if (count >= maxMessages) {
+        break;
+      }
+    }
+
+    return { ...conversation, messages: trimmedMessages };
+  }
+
+  private buildHistorySnapshotFromConversation(
+    conversation: ConversationRecord,
+    maxMessages?: number,
+  ): Array<{
+    role: 'user' | 'model';
+    content: string;
+    toolCalls?: HistorySnapshotToolCall[];
+    timestamp?: number;
+  }> {
+    const messages: Array<{
+      role: 'user' | 'model';
+      content: string;
+      toolCalls?: HistorySnapshotToolCall[];
+      timestamp?: number;
+    }> = [];
+
+    let count = 0;
+    for (const record of conversation.messages) {
+      if (record.type !== 'user' && record.type !== 'gemini') {
+        continue;
+      }
+      if (maxMessages !== undefined && count >= maxMessages) {
+        break;
+      }
+
+      const content = partListUnionToString(record.content ?? []);
+      const toolCalls =
+        record.type === 'gemini' && record.toolCalls?.length
+          ? record.toolCalls.map((call: ToolCallRecord) => ({
+              id: call.id,
+              name: call.name,
+              args: call.args ?? {},
+              status: call.status,
+              displayName: call.displayName,
+              description: call.description,
+              resultDisplay:
+                call.resultDisplay ??
+                (call.result ? partListUnionToString(call.result) : undefined),
+              renderOutputAsMarkdown: call.renderOutputAsMarkdown,
+            }))
+          : undefined;
+
+      const parsedTimestamp = record.timestamp
+        ? Date.parse(record.timestamp)
+        : NaN;
+
+      messages.push({
+        role: record.type === 'user' ? 'user' : 'model',
+        content,
+        toolCalls,
+        ...(Number.isFinite(parsedTimestamp)
+          ? { timestamp: parsedTimestamp }
+          : {}),
+      });
+      count += 1;
+    }
+
+    return messages;
+  }
+
+  async autoSaveSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    const autosaveTag = this.getAutosaveTag(session.conversationId);
+    if (!autosaveTag) {
+      return;
+    }
+
+    const historyLength = session.geminiClient.getHistory().length;
+    if (historyLength <= INITIAL_HISTORY_LENGTH) {
+      return;
+    }
+
+    const lastMessageIndex = historyLength - 1;
+    try {
+      await this.saveFromPoint(sessionId, lastMessageIndex, autosaveTag);
+    } catch (error) {
+      debugLogger.warn(
+        `[SessionManager] Autosave failed for ${autosaveTag}: ${String(error)}`,
+      );
     }
   }
 }

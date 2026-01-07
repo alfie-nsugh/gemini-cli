@@ -469,6 +469,72 @@ export class SessionManager {
     }
   }
 
+  async requestUserConfirmation(
+    sessionId: string,
+    details: {
+      title: string;
+      message?: string;
+      command?: string;
+      confirmLabel?: string;
+      cancelLabel?: string;
+    },
+  ): Promise<boolean> {
+    if (!this.rpcRequestSender) {
+      return false;
+    }
+
+    const title = details.message ?? details.title;
+    const permissionRequest: PermissionRequest = {
+      sessionId,
+      options: [
+        {
+          optionId: 'allow_once',
+          name: details.confirmLabel ?? 'Confirm',
+          kind: 'allow_once',
+        },
+        {
+          optionId: 'reject_once',
+          name: details.cancelLabel ?? 'Cancel',
+          kind: 'reject_once',
+        },
+      ],
+      toolCall: {
+        toolCallId: crypto.randomUUID(),
+        rawInput: {
+          ...(details.command ? { command: details.command } : {}),
+          ...(details.message ? { description: details.message } : {}),
+        },
+        status: 'pending',
+        title,
+        kind: 'execute',
+        ...(details.message
+          ? {
+              content: [
+                {
+                  type: 'content',
+                  content: { type: 'text', text: details.message },
+                },
+              ],
+            }
+          : {}),
+      },
+    };
+
+    try {
+      const response = (await this.rpcRequestSender(
+        'session/request_permission',
+        permissionRequest,
+      )) as PermissionResponse;
+      const optionId = response?.outcome?.optionId ?? response?.optionId;
+      return optionId?.startsWith('allow') ?? false;
+    } catch (error) {
+      debugLogger.warn(
+        `[SessionManager] Confirmation request failed: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
   private mapOptionIdToOutcome(optionId?: string): ToolConfirmationOutcome {
     switch (optionId) {
       case 'allow_always':

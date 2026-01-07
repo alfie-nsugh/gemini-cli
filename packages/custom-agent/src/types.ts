@@ -132,7 +132,8 @@ export type SessionUpdateType =
   | 'agent_thought_chunk'
   | 'tool_call'
   | 'tool_call_update'
-  | 'history_snapshot';
+  | 'history_snapshot'
+  | 'ui_notice';
 
 export interface SessionUpdate {
   sessionId: string;
@@ -152,6 +153,16 @@ export interface HistorySnapshotUpdate {
       toolCalls?: HistorySnapshotToolCall[];
       timestamp?: number;
     }>;
+  };
+}
+
+export interface UiNoticeUpdate {
+  sessionId: string;
+  update: {
+    sessionUpdate: 'ui_notice';
+    message: string;
+    level: 'info' | 'success' | 'warning' | 'error';
+    dismissible?: boolean;
   };
 }
 

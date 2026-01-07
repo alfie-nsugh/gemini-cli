@@ -185,19 +185,61 @@ export class CustomAgentServer {
     );
 
     if (slashResult.handled) {
-      // Emit the command result as a model message
-      if (slashResult.message && this.onSessionUpdate) {
-        this.onSessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            role: 'model',
-            content: {
-              type: 'text',
-              text: slashResult.message,
+      if (slashResult.type === 'confirm') {
+        const data = slashResult.data as
+          | { confirmAction?: string; saveName?: string }
+          | undefined;
+        if (data?.confirmAction === 'save_overwrite' && data.saveName) {
+          const confirmed = await this.sessionManager.requestUserConfirmation(
+            params.sessionId,
+            {
+              title: 'Overwrite checkpoint?',
+              message: `A checkpoint named "${data.saveName}" already exists. Overwrite?`,
+              command: `/chat save ${data.saveName}`,
+              confirmLabel: 'Overwrite',
+              cancelLabel: 'Cancel',
             },
-          },
-        });
+          );
+
+          if (confirmed) {
+            const historyLength = this.sessionManager.getHistoryLength(
+              params.sessionId,
+            );
+            const lastMessageIndex = historyLength > 0 ? historyLength - 1 : 0;
+            await this.sessionManager.saveFromPoint(
+              params.sessionId,
+              lastMessageIndex,
+              data.saveName,
+            );
+            this.emitUiNotice(
+              params.sessionId,
+              `Checkpoint saved: ${data.saveName}`,
+              'success',
+            );
+          } else {
+            this.emitUiNotice(
+              params.sessionId,
+              'Checkpoint overwrite cancelled.',
+              'info',
+            );
+          }
+        } else {
+          this.emitUiNotice(
+            params.sessionId,
+            slashResult.message ?? 'Confirmation required.',
+            'warning',
+          );
+        }
+
+        if (this.onEndTurn) {
+          this.onEndTurn();
+        }
+        return { stopReason: 'end_turn' };
+      }
+
+      if (slashResult.message) {
+        const level = this.mapNoticeLevel(slashResult.type);
+        this.emitUiNotice(params.sessionId, slashResult.message, level);
       }
 
       // If the command has a prompt to send (e.g., conductor commands)
@@ -220,6 +262,41 @@ export class CustomAgentServer {
     // Not a slash command, proceed with normal message
     await this.sessionManager.sendPrompt(params.sessionId, params.prompt);
     return { stopReason: 'end_turn' };
+  }
+
+  private emitUiNotice(
+    sessionId: string,
+    message: string,
+    level: 'info' | 'success' | 'warning' | 'error',
+  ): void {
+    if (!this.onSessionUpdate) {
+      return;
+    }
+
+    this.onSessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: 'ui_notice',
+        message,
+        level,
+        dismissible: true,
+      },
+    });
+  }
+
+  private mapNoticeLevel(
+    type?: 'info' | 'error' | 'success' | 'confirm',
+  ): 'info' | 'success' | 'warning' | 'error' {
+    switch (type) {
+      case 'error':
+        return 'error';
+      case 'success':
+        return 'success';
+      case 'confirm':
+        return 'warning';
+      default:
+        return 'info';
+    }
   }
 
   private normalizeSendPromptParams(params: SendPromptParams): {

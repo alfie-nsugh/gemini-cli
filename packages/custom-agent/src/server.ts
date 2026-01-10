@@ -20,6 +20,10 @@ import type {
   SendPromptParams,
   EditMessageParams,
   EditMessageResult,
+  RegenerateMessageParams,
+  RegenerateMessageResult,
+  GetMessageForEditParams,
+  GetMessageForEditResult,
   DeleteMessageParams,
   SaveFromPointParams,
   SaveFromPointResult,
@@ -86,6 +90,10 @@ export class CustomAgentServer {
       // Custom extension methods
       case 'session/editMessage':
         return this.editMessage(params as EditMessageParams);
+      case 'session/regenerate':
+        return this.regenerateMessage(params as RegenerateMessageParams);
+      case 'session/getMessageForEdit':
+        return this.getMessageForEdit(params as GetMessageForEditParams);
       case 'session/deleteMessage':
         return this.deleteMessage(params as DeleteMessageParams);
       case 'session/saveFromPoint':
@@ -121,6 +129,8 @@ export class CustomAgentServer {
         tools: this.toolsEnabled,
         customMethods: [
           'session/editMessage',
+          'session/regenerate',
+          'session/getMessageForEdit',
           'session/deleteMessage',
           'session/saveFromPoint',
           'session/resume',
@@ -334,6 +344,35 @@ export class CustomAgentServer {
       params.messageIndex,
       params.newContent,
       params.mode,
+      params.format,
+      params.tokenSetId,
+      params.partOverrides,
+    );
+  }
+
+  /**
+   * Custom: Regenerate a message from the previous user prompt
+   */
+  private async regenerateMessage(
+    params: RegenerateMessageParams,
+  ): Promise<RegenerateMessageResult> {
+    return this.sessionManager.regenerateMessage(
+      params.sessionId,
+      params.messageIndex,
+      params.mode,
+    );
+  }
+
+  /**
+   * Custom: Get a message formatted for editing (preserves non-text parts)
+   */
+  private async getMessageForEdit(
+    params: GetMessageForEditParams,
+  ): Promise<GetMessageForEditResult> {
+    return this.sessionManager.getMessageForEdit(
+      params.sessionId,
+      params.messageIndex,
+      params.exactIndex ?? false,
     );
   }
 

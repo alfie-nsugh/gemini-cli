@@ -8,6 +8,8 @@
  * Type definitions for the Custom Agent JSON-RPC protocol
  */
 
+import type { Part } from '@google/genai';
+
 // JSON-RPC 2.0 types
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -78,16 +80,51 @@ export interface SendPromptParams {
 }
 
 // Custom extension types
+export interface EditMessagePartOverride {
+  tokenId: string;
+  part: Part;
+}
+
 export interface EditMessageParams {
   sessionId: string;
   messageIndex: number;
   newContent: string;
   mode: 'fork' | 'inPlace';
+  format?: EditMessageFormat;
+  tokenSetId?: string;
+  partOverrides?: EditMessagePartOverride[];
 }
 
 export interface EditMessageResult {
   success: boolean;
   newSessionId?: string; // If mode is 'fork', a new session is created
+}
+
+export type EditMessageFormat = 'plain' | 'aionui-part-v1';
+
+export interface RegenerateMessageParams {
+  sessionId: string;
+  messageIndex: number;
+  mode: 'fork' | 'inPlace';
+}
+
+export interface RegenerateMessageResult {
+  success: boolean;
+  newSessionId?: string; // If mode is 'fork', a new session is created
+}
+
+export interface GetMessageForEditParams {
+  sessionId: string;
+  messageIndex: number;
+  exactIndex?: boolean;
+}
+
+export interface GetMessageForEditResult {
+  content: string;
+  format: EditMessageFormat;
+  tokenSetId?: string;
+  parts: EditMessagePartOverride[];
+  resolvedIndex?: number;
 }
 
 export interface DeleteMessageParams {
@@ -152,6 +189,7 @@ export interface HistorySnapshotUpdate {
       content: string;
       toolCalls?: HistorySnapshotToolCall[];
       timestamp?: number;
+      historyIndex?: number;
     }>;
   };
 }
@@ -170,6 +208,8 @@ export interface HistorySnapshotToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
+  callHistoryIndex?: number;
+  responseHistoryIndex?: number;
   status:
     | 'validating'
     | 'scheduled'

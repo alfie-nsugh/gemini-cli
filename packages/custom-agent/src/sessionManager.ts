@@ -23,7 +23,6 @@ import {
   type Checkpoint,
   type ConversationRecord,
   type ResumedSessionData,
-  type ToolCallRecord,
   debugLogger,
   GeminiEventType,
   CoreToolScheduler,
@@ -35,12 +34,17 @@ import {
   Kind,
   SHELL_TOOL_NAME,
   INITIAL_HISTORY_LENGTH,
-  partListUnionToString,
   encodeTagName,
+  isFunctionResponse,
+  isFunctionCall,
 } from '@google/gemini-cli-core';
 import { initConfig } from './initConfig.js';
 import type {
+  EditMessageFormat,
+  EditMessagePartOverride,
   EditMessageResult,
+  RegenerateMessageResult,
+  GetMessageForEditResult,
   HistorySnapshotToolCall,
   SaveFromPointResult,
   ListSavesResult,
@@ -76,6 +80,11 @@ type PermissionResponse = {
   optionId?: string;
 };
 
+const EDIT_MESSAGE_FORMAT: EditMessageFormat = 'aionui-part-v1';
+const EDIT_TOKEN_PREFIX = '[[AIONUI_PART:';
+const EDIT_TOKEN_SUFFIX = ']]';
+const EDIT_TOKEN_PATTERN = /\[\[AIONUI_PART:([a-f0-9-]+)\]\]/g;
+
 type ToolCallContent = {
   type: 'content' | 'diff';
   content?: {
@@ -106,10 +115,15 @@ interface SessionState {
   abortController: AbortController;
   toolScheduler: CoreToolScheduler;
   pendingPermissionRequests: Set<string>;
+  editTokenSets: Map<string, Map<string, Part>>;
+  editTokenTargets: Map<string, number>;
   toolCallCompletion: {
     resolve: (responseParts: Part[]) => void;
     reject: (error: Error) => void;
   } | null;
+  toolCallOrderByName: Map<string, string[]>;
+  toolCallNameById: Map<string, string>;
+  pendingToolCallIndexUpdates: Map<string, 'completed' | 'failed'>;
 }
 
 export class SessionManager {
@@ -169,7 +183,12 @@ export class SessionManager {
       abortController: new AbortController(),
       toolScheduler,
       pendingPermissionRequests: new Set(),
+      editTokenSets: new Map(),
+      editTokenTargets: new Map(),
       toolCallCompletion: null,
+      toolCallOrderByName: new Map(),
+      toolCallNameById: new Map(),
+      pendingToolCallIndexUpdates: new Map(),
     };
 
     this.sessions.set(sessionId, session);
@@ -206,9 +225,17 @@ export class SessionManager {
    * Send a prompt to the session using real GeminiChat
    */
   async sendPrompt(sessionId: string, prompt: string): Promise<void> {
+    await this.sendPromptWithParts(sessionId, [{ text: prompt }]);
+  }
+
+  private async sendPromptWithParts(
+    sessionId: string,
+    initialParts: Part[],
+  ): Promise<void> {
     const session = this.getSession(sessionId);
     const promptId = `${sessionId}-${Date.now()}`;
-    let requestParts: Part[] = [{ text: prompt }];
+    let requestParts: Part[] = initialParts;
+    let isToolResponseTurn = false;
 
     try {
       while (true) {
@@ -279,6 +306,11 @@ export class SessionManager {
           `[SessionManager] Response complete: ${fullResponse.length} chars`,
         );
 
+        if (isToolResponseTurn) {
+          this.flushToolCallIndexUpdates(sessionId);
+          isToolResponseTurn = false;
+        }
+
         if (toolCallRequests.length === 0) {
           break;
         }
@@ -296,6 +328,7 @@ export class SessionManager {
         }
 
         requestParts = toolResponses;
+        isToolResponseTurn = true;
       }
     } catch (error) {
       const errorMessage =
@@ -344,6 +377,9 @@ export class SessionManager {
     }
 
     for (const call of toolCalls) {
+      this.registerToolCall(session, call);
+      const { callHistoryIndex, responseHistoryIndex } =
+        this.resolveToolCallHistoryIndices(session, call.request.callId);
       this.emitStreamEvent(sessionId, {
         sessionUpdate: 'tool_call',
         toolCallId: call.request.callId,
@@ -353,6 +389,8 @@ export class SessionManager {
         rawInput: this.buildRawInput(call),
         content: this.buildToolCallContent(call),
         locations: this.buildLocations(call.request.args),
+        callHistoryIndex,
+        responseHistoryIndex,
       });
 
       if (call.status === 'awaiting_approval') {
@@ -378,6 +416,9 @@ export class SessionManager {
     const responseParts: Part[] = [];
 
     for (const call of completedToolCalls) {
+      this.registerToolCall(session, call);
+      const { callHistoryIndex, responseHistoryIndex } =
+        this.resolveToolCallHistoryIndices(session, call.request.callId);
       if (call.response?.responseParts) {
         responseParts.push(...call.response.responseParts);
       }
@@ -399,9 +440,12 @@ export class SessionManager {
         toolCallId: call.request.callId,
         status,
         content,
+        callHistoryIndex,
+        responseHistoryIndex,
       });
 
       session.pendingPermissionRequests.delete(call.request.callId);
+      session.pendingToolCallIndexUpdates.set(call.request.callId, status);
     }
 
     if (session.toolCallCompletion) {
@@ -641,6 +685,96 @@ export class SessionManager {
     ];
   }
 
+  private registerToolCall(
+    session: SessionState,
+    call: ToolCall | WaitingToolCall | CompletedToolCall,
+  ): void {
+    const toolCallId = call.request.callId;
+    if (session.toolCallNameById.has(toolCallId)) {
+      return;
+    }
+    const name = call.request.name ?? 'unknown';
+    session.toolCallNameById.set(toolCallId, name);
+    const order = session.toolCallOrderByName.get(name) ?? [];
+    order.push(toolCallId);
+    session.toolCallOrderByName.set(name, order);
+  }
+
+  private resolveToolCallHistoryIndices(
+    session: SessionState,
+    toolCallId: string,
+  ): { callHistoryIndex?: number; responseHistoryIndex?: number } {
+    const name = session.toolCallNameById.get(toolCallId);
+    if (!name) {
+      return {};
+    }
+    const order = session.toolCallOrderByName.get(name) ?? [];
+    const ordinal = order.indexOf(toolCallId);
+    if (ordinal < 0) {
+      return {};
+    }
+
+    const history = session.geminiClient.getHistory();
+    let callHistoryIndex: number | undefined;
+    let responseHistoryIndex: number | undefined;
+    let callCount = 0;
+    let responseCount = 0;
+
+    for (let index = INITIAL_HISTORY_LENGTH; index < history.length; index++) {
+      const entry = history[index];
+      for (const part of entry.parts ?? []) {
+        if (part.functionCall?.name === name) {
+          if (callCount === ordinal && callHistoryIndex === undefined) {
+            callHistoryIndex = index;
+          }
+          callCount += 1;
+        }
+        if (part.functionResponse?.name === name) {
+          if (responseCount === ordinal && responseHistoryIndex === undefined) {
+            responseHistoryIndex = index;
+          }
+          responseCount += 1;
+        }
+      }
+      if (
+        callHistoryIndex !== undefined &&
+        responseHistoryIndex !== undefined
+      ) {
+        break;
+      }
+    }
+
+    return { callHistoryIndex, responseHistoryIndex };
+  }
+
+  private flushToolCallIndexUpdates(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.pendingToolCallIndexUpdates.size === 0) {
+      return;
+    }
+
+    const pending = new Map(session.pendingToolCallIndexUpdates);
+    session.pendingToolCallIndexUpdates.clear();
+
+    for (const [toolCallId, status] of pending.entries()) {
+      const { callHistoryIndex, responseHistoryIndex } =
+        this.resolveToolCallHistoryIndices(session, toolCallId);
+      if (
+        callHistoryIndex === undefined &&
+        responseHistoryIndex === undefined
+      ) {
+        continue;
+      }
+      this.emitStreamEvent(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId,
+        status,
+        callHistoryIndex,
+        responseHistoryIndex,
+      });
+    }
+  }
+
   private formatToolResult(call: CompletedToolCall): string {
     const resultDisplay = call.response?.resultDisplay;
     if (typeof resultDisplay === 'string') {
@@ -687,30 +821,49 @@ export class SessionManager {
     messageIndex: number,
     newContent: string,
     mode: 'fork' | 'inPlace',
+    format?: EditMessageFormat,
+    tokenSetId?: string,
+    partOverrides?: EditMessagePartOverride[],
   ): Promise<EditMessageResult> {
     const session = this.getSession(sessionId);
     const history = session.geminiClient.getHistory();
 
-    if (messageIndex < 0 || messageIndex >= history.length) {
-      throw new Error(`Invalid message index: ${messageIndex}`);
+    const resolvedIndex = tokenSetId
+      ? session.editTokenTargets.get(tokenSetId)
+      : undefined;
+    const targetIndex =
+      typeof resolvedIndex === 'number' ? resolvedIndex : messageIndex;
+
+    if (targetIndex < 0 || targetIndex >= history.length) {
+      throw new Error(`Invalid message index: ${targetIndex}`);
     }
 
-    const originalMessage = history[messageIndex];
+    const originalMessage = history[targetIndex];
+    const updatedParts =
+      format === EDIT_MESSAGE_FORMAT
+        ? this.parseEditableContent(
+            session,
+            newContent,
+            tokenSetId,
+            partOverrides,
+          )
+        : [{ text: newContent }];
 
     if (mode === 'inPlace') {
       // Edit in place: modify history directly
-      history[messageIndex] = {
+      history[targetIndex] = {
         ...originalMessage,
-        parts: [{ text: newContent }],
+        parts: updatedParts,
       };
       session.geminiClient.setHistory(history);
+      this.emitHistorySnapshot(sessionId);
       return { success: true };
     } else {
       // Fork mode: create new session with truncated history
-      const newHistory = history.slice(0, messageIndex);
+      const newHistory = history.slice(0, targetIndex);
       newHistory.push({
         ...originalMessage,
-        parts: [{ text: newContent }],
+        parts: updatedParts,
       });
 
       const newSessionId = await this.createSession(
@@ -719,9 +872,161 @@ export class SessionManager {
       );
       const newSession = this.getSession(newSessionId);
       newSession.geminiClient.setHistory(newHistory);
+      this.emitHistorySnapshot(newSessionId);
 
       return { success: true, newSessionId };
     }
+  }
+
+  /**
+   * Regenerate a model response from the previous user prompt.
+   * - inPlace: Replace only the target model response, keep subsequent messages
+   * - fork: Truncate at the prompt and create a new session
+   */
+  async regenerateMessage(
+    sessionId: string,
+    messageIndex: number,
+    mode: 'fork' | 'inPlace',
+  ): Promise<RegenerateMessageResult> {
+    const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
+
+    if (messageIndex < 0 || messageIndex >= history.length) {
+      throw new Error(`Invalid message index: ${messageIndex}`);
+    }
+
+    const targetMessage = history[messageIndex];
+    if (targetMessage.role !== 'model') {
+      throw new Error('Regenerate is only supported for model messages.');
+    }
+    if (isFunctionCall(targetMessage)) {
+      throw new Error(
+        'Cannot regenerate a tool-call message. Regenerate the final model response instead.',
+      );
+    }
+
+    const promptIndex = this.findRegenerationPromptIndex(history, messageIndex);
+    if (promptIndex === null) {
+      throw new Error('No user prompt found to regenerate from.');
+    }
+
+    const promptParts = history[promptIndex].parts ?? [];
+    if (promptParts.length === 0) {
+      throw new Error('User prompt is empty.');
+    }
+
+    // History before the user prompt (kept in both modes)
+    const baseHistory = history.slice(0, promptIndex);
+
+    if (mode === 'inPlace') {
+      // Save everything AFTER the target model message to restore later
+      const tailHistory = history.slice(messageIndex + 1);
+
+      // Truncate to just before the user prompt
+      session.geminiClient.setHistory(baseHistory);
+      this.emitHistorySnapshot(sessionId);
+
+      // Regenerate the response
+      await this.sendPromptWithParts(sessionId, promptParts);
+
+      // Restore the tail (subsequent messages) after regeneration
+      if (tailHistory.length > 0) {
+        const currentHistory = session.geminiClient.getHistory();
+        session.geminiClient.setHistory([...currentHistory, ...tailHistory]);
+      }
+
+      this.emitHistorySnapshot(sessionId);
+
+      return { success: true };
+    }
+
+    // Fork mode: truncate and create new session
+    const newSessionId = await this.createSession(
+      session.workingDirectory,
+      session.conversationId,
+    );
+    const newSession = this.getSession(newSessionId);
+    newSession.geminiClient.setHistory(baseHistory);
+    this.emitHistorySnapshot(newSessionId);
+    await this.sendPromptWithParts(newSessionId, promptParts);
+
+    return { success: true, newSessionId };
+  }
+
+  /**
+   * Get a message in a lossless editable format.
+   * If the target message has no text content (e.g., tool-call-only), we search
+   * forward for the next model message with actual text content.
+   */
+  async getMessageForEdit(
+    sessionId: string,
+    messageIndex: number,
+    exactIndex = false,
+  ): Promise<GetMessageForEditResult> {
+    const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
+
+    if (messageIndex < 0 || messageIndex >= history.length) {
+      throw new Error(`Invalid message index: ${messageIndex}`);
+    }
+
+    let targetIndex = messageIndex;
+    let message = history[targetIndex];
+
+    // If target message has no text, search forward for next model message with text
+    const hasTextContent = (msg: Content): boolean =>
+      (msg.parts ?? []).some((p) => typeof p.text === 'string');
+
+    if (!hasTextContent(message) && !exactIndex) {
+      debugLogger.log(
+        `[getMessageForEdit] Index ${targetIndex} has no text, searching forward...`,
+      );
+      for (let i = targetIndex + 1; i < history.length; i++) {
+        const candidate = history[i];
+        if (candidate.role === message.role && hasTextContent(candidate)) {
+          debugLogger.log(`[getMessageForEdit] Found text at index ${i}`);
+          targetIndex = i;
+          message = candidate;
+          break;
+        }
+        // Stop if we hit a different role (user after model, etc.)
+        if (candidate.role !== message.role && !isFunctionResponse(candidate)) {
+          break;
+        }
+      }
+    }
+
+    const parts = message.parts ?? [];
+
+    const tokenSetId = crypto.randomUUID();
+    const tokenMap = new Map<string, Part>();
+    session.editTokenSets.set(tokenSetId, tokenMap);
+    session.editTokenTargets.set(tokenSetId, targetIndex);
+
+    const partEntries: EditMessagePartOverride[] = [];
+    let content = '';
+    for (const part of parts) {
+      debugLogger.log(
+        `[getMessageForEdit] Part keys: ${Object.keys(part).join(', ')} | text type: ${typeof part.text}`,
+      );
+      if (typeof part.text === 'string') {
+        content += part.text;
+        continue;
+      }
+
+      const tokenId = crypto.randomUUID();
+      tokenMap.set(tokenId, part);
+      partEntries.push({ tokenId, part });
+      content += `${EDIT_TOKEN_PREFIX}${tokenId}${EDIT_TOKEN_SUFFIX}`;
+    }
+
+    return {
+      content,
+      format: EDIT_MESSAGE_FORMAT,
+      tokenSetId,
+      parts: partEntries,
+      resolvedIndex: targetIndex,
+    };
   }
 
   /**
@@ -737,6 +1042,7 @@ export class SessionManager {
 
     history.splice(messageIndex, 1);
     session.geminiClient.setHistory(history);
+    this.emitHistorySnapshot(sessionId);
   }
 
   /**
@@ -788,6 +1094,7 @@ export class SessionManager {
       role: 'user' | 'model';
       content: string;
       toolCalls?: HistorySnapshotToolCall[];
+      historyIndex?: number;
     }>;
   }> {
     const cwd = workingDirectory ?? process.cwd();
@@ -829,25 +1136,19 @@ export class SessionManager {
       session.geminiClient.setHistory(checkpoint.history);
     }
 
-    const messages = recording?.conversation
-      ? this.buildHistorySnapshotFromConversation(
-          recording.conversation,
-          messageLimit,
-        )
-      : checkpoint.history.slice(INITIAL_HISTORY_LENGTH).reduce<
-          Array<{
-            role: 'user' | 'model';
-            content: string;
-            toolCalls?: HistorySnapshotToolCall[];
-          }>
-        >((acc, content) => {
-          const role = content.role === 'user' ? 'user' : 'model';
-          const text = this.formatHistoryParts(content.parts).trim();
-          if (text.length > 0) {
-            acc.push({ role, content: text });
-          }
-          return acc;
-        }, []);
+    // Prefer raw history for UI snapshots so tool calls reconstructed from
+    // functionCall/functionResponse parts stay visible after resume/edit.
+    const historyForSnapshot =
+      typeof messageLimit === 'number'
+        ? checkpoint.history.slice(
+            0,
+            Math.min(
+              checkpoint.history.length,
+              INITIAL_HISTORY_LENGTH + messageLimit,
+            ),
+          )
+        : checkpoint.history;
+    const messages = this.buildHistorySnapshotFromContents(historyForSnapshot);
 
     // Emit restored messages to frontend so they appear in the chat window
     this.emitStreamEvent(sessionId, {
@@ -992,6 +1293,325 @@ export class SessionManager {
     return parts.map((part) => (part.text ? part.text : '')).join('');
   }
 
+  private findRegenerationPromptIndex(
+    history: Content[],
+    messageIndex: number,
+  ): number | null {
+    for (let i = messageIndex - 1; i >= INITIAL_HISTORY_LENGTH; i--) {
+      const entry = history[i];
+      if (entry.role !== 'user') {
+        continue;
+      }
+      if (isFunctionResponse(entry)) {
+        continue;
+      }
+      return i;
+    }
+    return null;
+  }
+
+  private buildHistoryPlaceholder(
+    parts?: Part[],
+    toolCalls?: HistorySnapshotToolCall[],
+  ): string {
+    if (!parts || parts.length === 0) {
+      return toolCalls && toolCalls.length > 0 ? '[Tool call]' : '';
+    }
+
+    let hasInlineData = false;
+    let inlineIsImage = false;
+    let hasFileData = false;
+    let hasFunctionCall = false;
+    let hasExecutableCode = false;
+    let hasCodeExecutionResult = false;
+    let hasThought = false;
+
+    for (const part of parts) {
+      if (part.inlineData) {
+        hasInlineData = true;
+        const mimeType = part.inlineData.mimeType ?? '';
+        if (mimeType.startsWith('image/')) {
+          inlineIsImage = true;
+        }
+      }
+      if (part.fileData) {
+        hasFileData = true;
+      }
+      if (part.functionCall) {
+        hasFunctionCall = true;
+      }
+      if ((part as { executableCode?: unknown }).executableCode !== undefined) {
+        hasExecutableCode = true;
+      }
+      if (
+        (part as { codeExecutionResult?: unknown }).codeExecutionResult !==
+        undefined
+      ) {
+        hasCodeExecutionResult = true;
+      }
+      if ((part as { thought?: unknown }).thought !== undefined) {
+        hasThought = true;
+      }
+    }
+
+    const labels: string[] = [];
+    if (hasInlineData) {
+      labels.push(inlineIsImage ? 'Image' : 'Inline data');
+    }
+    if (hasFileData) {
+      labels.push('File');
+    }
+    if (hasFunctionCall || (toolCalls && toolCalls.length > 0)) {
+      labels.push('Tool call');
+    }
+    if (hasExecutableCode) {
+      labels.push('Executable code');
+    }
+    if (hasCodeExecutionResult) {
+      labels.push('Code execution result');
+    }
+    if (hasThought) {
+      labels.push('Thought');
+    }
+
+    if (labels.length === 0) {
+      return '';
+    }
+
+    return `[${labels.join(', ')}]`;
+  }
+
+  private stringifyToolResult(value: unknown): string | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
+  /**
+   * Reconstruct tool calls from Gemini history for UI display.
+   *
+   * Gemini stores tool calls as separate messages:
+   *   [Model] functionCall: { name, args }
+   *   [User]  functionResponse: { name, response }
+   *
+   * This function combines them into a single HistorySnapshotToolCall with
+   * both the input args and the result, keyed by the MODEL message index.
+   *
+   * Uses simple FIFO name-based matching since Gemini doesn't persist IDs in history.
+   */
+  private collectToolCallsFromHistory(
+    history: Content[],
+  ): Map<number, HistorySnapshotToolCall[]> {
+    const toolCallsByIndex = new Map<number, HistorySnapshotToolCall[]>();
+
+    // Track pending calls by name (FIFO queue for each name)
+    const pendingByName = new Map<
+      string,
+      Array<{
+        index: number;
+        toolCall: HistorySnapshotToolCall;
+      }>
+    >();
+
+    let idCounter = 0;
+
+    for (let index = INITIAL_HISTORY_LENGTH; index < history.length; index++) {
+      const entry = history[index];
+
+      for (const part of entry.parts ?? []) {
+        // Handle functionCall - create pending tool call at this model message index
+        if (part.functionCall) {
+          const name = part.functionCall.name ?? 'unknown';
+          const args =
+            (part.functionCall.args as Record<string, unknown>) ?? {};
+
+          const toolCall: HistorySnapshotToolCall = {
+            id: `${name}-${index}-${idCounter++}`,
+            name,
+            args,
+            callHistoryIndex: index,
+            status: 'scheduled',
+          };
+
+          // Add to result map at this index
+          const existing = toolCallsByIndex.get(index) ?? [];
+          existing.push(toolCall);
+          toolCallsByIndex.set(index, existing);
+
+          // Queue for matching with later functionResponse
+          const queue = pendingByName.get(name) ?? [];
+          queue.push({ index, toolCall });
+          pendingByName.set(name, queue);
+        }
+
+        // Handle functionResponse - update the matching pending call
+        if (part.functionResponse) {
+          const name = part.functionResponse.name ?? 'unknown';
+          const responsePayload = (
+            part.functionResponse as { response?: unknown }
+          ).response;
+
+          // Check for error in response
+          const errorValue =
+            responsePayload && typeof responsePayload === 'object'
+              ? (responsePayload as { error?: unknown }).error
+              : undefined;
+          const status = errorValue !== undefined ? 'error' : 'success';
+          const resultDisplay = this.stringifyToolResult(
+            errorValue ?? responsePayload,
+          );
+
+          // Find matching pending call (FIFO by name)
+          const queue = pendingByName.get(name);
+          if (queue && queue.length > 0) {
+            const pending = queue.shift()!;
+            if (queue.length === 0) pendingByName.delete(name);
+
+            // Update the existing toolCall with result
+            pending.toolCall.status = status;
+            pending.toolCall.responseHistoryIndex = index;
+            if (resultDisplay) pending.toolCall.resultDisplay = resultDisplay;
+          }
+          // If no matching call found, skip (orphaned response)
+        }
+      }
+    }
+
+    return toolCallsByIndex;
+  }
+
+  private parseEditableContent(
+    session: SessionState,
+    content: string,
+    tokenSetId?: string,
+    partOverrides?: EditMessagePartOverride[],
+  ): Part[] {
+    if (!tokenSetId) {
+      throw new Error('Missing token set for edit content.');
+    }
+
+    const tokenMap = session.editTokenSets.get(tokenSetId);
+    if (!tokenMap) {
+      throw new Error(
+        'Edit token set expired. Reopen the editor and try again.',
+      );
+    }
+
+    if (partOverrides?.length) {
+      for (const override of partOverrides) {
+        if (!tokenMap.has(override.tokenId)) {
+          throw new Error(`Unknown edit token: ${override.tokenId}`);
+        }
+        tokenMap.set(override.tokenId, override.part);
+      }
+    }
+
+    const parts: Part[] = [];
+    const tokenPattern = new RegExp(EDIT_TOKEN_PATTERN.source, 'g');
+    let cursor = 0;
+
+    for (const match of content.matchAll(tokenPattern)) {
+      const matchIndex = match.index ?? 0;
+      const textSegment = content.slice(cursor, matchIndex);
+      if (textSegment) {
+        parts.push({ text: textSegment });
+      }
+
+      const tokenId = match[1];
+      const tokenPart = tokenMap.get(tokenId);
+      if (!tokenPart) {
+        throw new Error(`Unknown edit token: ${tokenId}`);
+      }
+      parts.push(tokenPart);
+
+      cursor = matchIndex + match[0].length;
+    }
+
+    const tail = content.slice(cursor);
+    if (tail) {
+      parts.push({ text: tail });
+    }
+
+    session.editTokenSets.delete(tokenSetId);
+    session.editTokenTargets.delete(tokenSetId);
+    return parts;
+  }
+
+  private emitHistorySnapshot(sessionId: string): void {
+    const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
+    const messages = this.buildHistorySnapshotFromContents(history);
+
+    this.emitStreamEvent(sessionId, {
+      sessionUpdate: 'history_snapshot',
+      messages,
+    });
+  }
+
+  private buildHistorySnapshotFromContents(history: Content[]): Array<{
+    role: 'user' | 'model';
+    content: string;
+    toolCalls?: HistorySnapshotToolCall[];
+    historyIndex?: number;
+  }> {
+    const toolCallsByHistoryIndex = this.collectToolCallsFromHistory(history);
+
+    const messages: Array<{
+      role: 'user' | 'model';
+      content: string;
+      toolCalls?: HistorySnapshotToolCall[];
+      historyIndex?: number;
+    }> = [];
+
+    for (let index = INITIAL_HISTORY_LENGTH; index < history.length; index++) {
+      const entry = history[index];
+
+      const role = entry.role === 'user' ? 'user' : 'model';
+      const text = this.formatHistoryParts(entry.parts).trim();
+
+      // Only attach toolCalls to MODEL messages (where the functionCall originated)
+      // User messages contain functionResponse which is already captured in toolCall.resultDisplay
+      const toolCalls =
+        role === 'model' ? toolCallsByHistoryIndex.get(index) : undefined;
+      const hasToolCallsToDisplay = toolCalls && toolCalls.length > 0;
+
+      // Skip user messages that only contain functionResponse (no real user content)
+      if (role === 'user' && isFunctionResponse(entry)) {
+        continue;
+      }
+
+      // If we have toolCalls, we don't need a [Tool call] placeholder - the frontend
+      // will render the toolCalls array as a tool_group.
+      const content =
+        text.length > 0
+          ? text
+          : hasToolCallsToDisplay
+            ? ''
+            : this.buildHistoryPlaceholder(entry.parts, undefined);
+
+      if (!content && !hasToolCallsToDisplay) {
+        continue;
+      }
+
+      messages.push({
+        role,
+        content,
+        toolCalls,
+        historyIndex: index,
+      });
+    }
+
+    return messages;
+  }
+
   private getAutosaveTag(conversationId?: string): string | null {
     if (!conversationId) {
       return null;
@@ -1126,66 +1746,6 @@ export class SessionManager {
     }
 
     return { ...conversation, messages: trimmedMessages };
-  }
-
-  private buildHistorySnapshotFromConversation(
-    conversation: ConversationRecord,
-    maxMessages?: number,
-  ): Array<{
-    role: 'user' | 'model';
-    content: string;
-    toolCalls?: HistorySnapshotToolCall[];
-    timestamp?: number;
-  }> {
-    const messages: Array<{
-      role: 'user' | 'model';
-      content: string;
-      toolCalls?: HistorySnapshotToolCall[];
-      timestamp?: number;
-    }> = [];
-
-    let count = 0;
-    for (const record of conversation.messages) {
-      if (record.type !== 'user' && record.type !== 'gemini') {
-        continue;
-      }
-      if (maxMessages !== undefined && count >= maxMessages) {
-        break;
-      }
-
-      const content = partListUnionToString(record.content ?? []);
-      const toolCalls =
-        record.type === 'gemini' && record.toolCalls?.length
-          ? record.toolCalls.map((call: ToolCallRecord) => ({
-              id: call.id,
-              name: call.name,
-              args: call.args ?? {},
-              status: call.status,
-              displayName: call.displayName,
-              description: call.description,
-              resultDisplay:
-                call.resultDisplay ??
-                (call.result ? partListUnionToString(call.result) : undefined),
-              renderOutputAsMarkdown: call.renderOutputAsMarkdown,
-            }))
-          : undefined;
-
-      const parsedTimestamp = record.timestamp
-        ? Date.parse(record.timestamp)
-        : NaN;
-
-      messages.push({
-        role: record.type === 'user' ? 'user' : 'model',
-        content,
-        toolCalls,
-        ...(Number.isFinite(parsedTimestamp)
-          ? { timestamp: parsedTimestamp }
-          : {}),
-      });
-      count += 1;
-    }
-
-    return messages;
   }
 
   async autoSaveSession(sessionId: string): Promise<void> {

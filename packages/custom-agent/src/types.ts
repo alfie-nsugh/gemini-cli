@@ -170,6 +170,7 @@ export type SessionUpdateType =
   | 'tool_call'
   | 'tool_call_update'
   | 'history_snapshot'
+  | 'history_index_update'
   | 'ui_notice';
 
 export interface SessionUpdate {
@@ -191,6 +192,15 @@ export interface HistorySnapshotUpdate {
       timestamp?: number;
       historyIndex?: number;
     }>;
+  };
+}
+
+export interface HistoryIndexUpdate {
+  sessionId: string;
+  update: {
+    sessionUpdate: 'history_index_update';
+    lastUserIndex?: number;
+    lastModelIndex?: number;
   };
 }
 

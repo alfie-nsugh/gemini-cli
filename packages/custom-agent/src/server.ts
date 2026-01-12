@@ -158,7 +158,19 @@ export class CustomAgentServer {
     const autosaveTag = this.sessionManager.getAutosaveTagForConversation(
       params.conversationId,
     );
-    if (autosaveTag && (await this.sessionManager.saveExists(autosaveTag))) {
+    const autosaveExists = autosaveTag
+      ? await this.sessionManager.saveExists(autosaveTag, { sessionId })
+      : false;
+    debugLogger.warn(
+      `[AutosaveDebug] new_session_autosave_check ${JSON.stringify({
+        sessionId,
+        conversationId: params.conversationId,
+        workingDirectory,
+        autosaveTag,
+        autosaveExists,
+      })}`,
+    );
+    if (autosaveTag && autosaveExists) {
       try {
         await this.sessionManager.resumeSession(
           autosaveTag,
@@ -423,6 +435,8 @@ export class CustomAgentServer {
       debugLogger.warn(`[CustomAgentServer] Autosave failed: ${String(error)}`);
     }
 
+    this.sessionManager.emitHistoryIndexUpdate(sessionId);
+
     if (this.onEndTurn) {
       this.onEndTurn();
     }
@@ -471,6 +485,7 @@ export class CustomAgentServer {
       params.partial,
       this.sessionManager,
       config,
+      params.sessionId,
     );
 
     // Map to SlashCommandInfo format for frontend compatibility

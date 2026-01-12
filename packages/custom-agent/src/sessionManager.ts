@@ -59,6 +59,13 @@ type PermissionOption = {
   kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always';
 };
 
+type SaveLookupOptions = {
+  sessionId?: string;
+  workingDirectory?: string;
+  conversationId?: string;
+  filterAutosavesToConversation?: boolean;
+};
+
 type PermissionRequest = {
   sessionId: string;
   options: PermissionOption[];
@@ -130,6 +137,26 @@ export class SessionManager {
   private sessions = new Map<string, SessionState>();
   private rpcRequestSender: RpcRequestSender | null = null;
 
+  private logAutosave(event: string, details: Record<string, unknown>): void {
+    debugLogger.warn(`[AutosaveDebug] ${event} ${JSON.stringify(details)}`);
+  }
+
+  private getStorageForLookup(options?: SaveLookupOptions): Storage {
+    if (options?.sessionId && this.sessions.has(options.sessionId)) {
+      return this.getSession(options.sessionId).storage;
+    }
+
+    if (options?.workingDirectory) {
+      return new Storage(path.resolve(options.workingDirectory));
+    }
+
+    if (this.sessions.size > 0) {
+      return Array.from(this.sessions.values())[0].storage;
+    }
+
+    return new Storage(process.cwd());
+  }
+
   // Event callbacks (wired by server.ts)
   onStreamEvent:
     | ((sessionId: string, event: SessionUpdate['update']) => void)
@@ -148,7 +175,8 @@ export class SessionManager {
     conversationId?: string,
   ): Promise<string> {
     const sessionId = crypto.randomUUID();
-    const cwd = workingDirectory ?? process.cwd();
+    const rawWorkingDirectory = workingDirectory;
+    const cwd = path.resolve(rawWorkingDirectory ?? process.cwd());
 
     // Initialize full Config with GeminiClient
     const config = await initConfig(sessionId, cwd);
@@ -192,6 +220,13 @@ export class SessionManager {
     };
 
     this.sessions.set(sessionId, session);
+    this.logAutosave('session_created', {
+      sessionId,
+      conversationId,
+      workingDirectory: cwd,
+      rawWorkingDirectory,
+      projectTempDir: storage.getProjectTempDir(),
+    });
     debugLogger.log(`[SessionManager] Created session ${sessionId} in ${cwd}`);
     return sessionId;
   }
@@ -1077,6 +1112,14 @@ export class SessionManager {
     debugLogger.log(
       `[SessionManager] Saved checkpoint "${saveName}" at ${savePath}`,
     );
+    if (saveName.startsWith('aionui-autosave-')) {
+      this.logAutosave('autosave_saved', {
+        sessionId,
+        saveName,
+        savePath,
+        projectTempDir: session.storage.getProjectTempDir(),
+      });
+    }
     return { success: true, savePath };
   }
 
@@ -1097,7 +1140,8 @@ export class SessionManager {
       historyIndex?: number;
     }>;
   }> {
-    const cwd = workingDirectory ?? process.cwd();
+    const rawWorkingDirectory = workingDirectory;
+    const cwd = path.resolve(rawWorkingDirectory ?? process.cwd());
     let sessionId = providedSessionId;
     let session: SessionState;
     if (sessionId && this.sessions.has(sessionId)) {
@@ -1109,6 +1153,17 @@ export class SessionManager {
       sessionId = await this.createSession(cwd, conversationId);
       session = this.getSession(sessionId);
     }
+    this.logAutosave('resume_requested', {
+      sessionId,
+      saveName,
+      providedSessionId,
+      conversationId,
+      rawWorkingDirectory,
+      resolvedWorkingDirectory: cwd,
+      reusedSession: Boolean(
+        providedSessionId && this.sessions.has(providedSessionId),
+      ),
+    });
 
     // Load checkpoint
     const checkpoint = await session.logger.loadCheckpoint(saveName);
@@ -1116,6 +1171,15 @@ export class SessionManager {
     if (checkpoint.history.length === 0) {
       throw new Error(`Save not found: ${saveName}`);
     }
+
+    this.logAutosave('resume_loaded', {
+      sessionId,
+      saveName,
+      conversationId: session.conversationId,
+      workingDirectory: session.workingDirectory,
+      projectTempDir: session.storage.getProjectTempDir(),
+      historyLength: checkpoint.history.length,
+    });
 
     const metadata = await this.loadCheckpointMetadata(
       session.storage,
@@ -1166,11 +1230,8 @@ export class SessionManager {
   /**
    * List all saved conversations
    */
-  async listSaves(): Promise<ListSavesResult> {
-    const storage =
-      this.sessions.size > 0
-        ? Array.from(this.sessions.values())[0].storage
-        : new Storage(process.cwd());
+  async listSaves(options?: SaveLookupOptions): Promise<ListSavesResult> {
+    const storage = this.getStorageForLookup(options);
 
     const checkpointsDir = storage.getProjectTempDir();
 
@@ -1209,6 +1270,19 @@ export class SessionManager {
         }
       }
 
+      if (options?.filterAutosavesToConversation) {
+        const autosaveTag = options.conversationId
+          ? this.getAutosaveTag(options.conversationId)
+          : null;
+        const autosavePrefix = 'aionui-autosave-';
+        const filtered = saves.filter(
+          (save) =>
+            !save.name.startsWith(autosavePrefix) ||
+            (autosaveTag !== null && save.name === autosaveTag),
+        );
+        return { saves: filtered };
+      }
+
       return { saves };
     } catch {
       return { saves: [] };
@@ -1218,11 +1292,11 @@ export class SessionManager {
   /**
    * Check if a checkpoint with the given name already exists
    */
-  async saveExists(saveName: string): Promise<boolean> {
-    const storage =
-      this.sessions.size > 0
-        ? Array.from(this.sessions.values())[0].storage
-        : new Storage(process.cwd());
+  async saveExists(
+    saveName: string,
+    options?: SaveLookupOptions,
+  ): Promise<boolean> {
+    const storage = this.getStorageForLookup(options);
 
     const checkpointsDir = storage.getProjectTempDir();
     const encodedTag = encodeTagName(saveName);
@@ -1556,6 +1630,40 @@ export class SessionManager {
     });
   }
 
+  emitHistoryIndexUpdate(sessionId: string): void {
+    const session = this.getSession(sessionId);
+    const history = session.geminiClient.getHistory();
+
+    let lastUserIndex: number | undefined;
+    let lastModelIndex: number | undefined;
+
+    for (let i = history.length - 1; i >= INITIAL_HISTORY_LENGTH; i--) {
+      const entry = history[i];
+      if (entry.role === 'user' && !isFunctionResponse(entry)) {
+        lastUserIndex = i;
+        break;
+      }
+    }
+
+    for (let i = history.length - 1; i >= INITIAL_HISTORY_LENGTH; i--) {
+      const entry = history[i];
+      if (entry.role === 'model' && !isFunctionCall(entry)) {
+        lastModelIndex = i;
+        break;
+      }
+    }
+
+    if (lastUserIndex === undefined && lastModelIndex === undefined) {
+      return;
+    }
+
+    this.emitStreamEvent(sessionId, {
+      sessionUpdate: 'history_index_update',
+      lastUserIndex,
+      lastModelIndex,
+    });
+  }
+
   private buildHistorySnapshotFromContents(history: Content[]): Array<{
     role: 'user' | 'model';
     content: string;
@@ -1756,11 +1864,21 @@ export class SessionManager {
 
     const autosaveTag = this.getAutosaveTag(session.conversationId);
     if (!autosaveTag) {
+      this.logAutosave('autosave_skipped', {
+        sessionId,
+        reason: 'missing_conversation_id',
+      });
       return;
     }
 
     const historyLength = session.geminiClient.getHistory().length;
     if (historyLength <= INITIAL_HISTORY_LENGTH) {
+      this.logAutosave('autosave_skipped', {
+        sessionId,
+        autosaveTag,
+        reason: 'no_history',
+        historyLength,
+      });
       return;
     }
 
@@ -1771,6 +1889,11 @@ export class SessionManager {
       debugLogger.warn(
         `[SessionManager] Autosave failed for ${autosaveTag}: ${String(error)}`,
       );
+      this.logAutosave('autosave_failed', {
+        sessionId,
+        autosaveTag,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 }

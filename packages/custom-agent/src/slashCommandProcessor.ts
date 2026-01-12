@@ -411,7 +411,9 @@ async function processChatCommand(
       try {
         // Check if save already exists (unless force flag is set)
         if (!forceFlag) {
-          const exists = await sessionManager.saveExists(saveName);
+          const exists = await sessionManager.saveExists(saveName, {
+            sessionId,
+          });
           if (exists) {
             return {
               handled: true,
@@ -483,12 +485,16 @@ async function processChatCommand(
 
     case 'list': {
       try {
-        const result = await sessionManager.listSaves();
+        const result = await sessionManager.listSaves({
+          sessionId,
+          conversationId: sessionManager.getConversationId(sessionId),
+          filterAutosavesToConversation: true,
+        });
         if (result.saves.length === 0) {
           return {
             handled: true,
             type: 'info',
-            message: 'No saved checkpoints found.',
+            message: 'No saved checkpoints found for this workspace.',
           };
         }
 
@@ -724,6 +730,7 @@ export async function getCompletions(
   input: string,
   sessionManager: SessionManager,
   config: Config | null,
+  sessionId?: string,
 ): Promise<CompletionItem[]> {
   const trimmed = input.trim();
 
@@ -737,6 +744,7 @@ export async function getCompletions(
     trimmed,
     sessionManager,
     config,
+    sessionId,
   );
   if (argCompletions.length > 0) {
     return argCompletions;
@@ -764,13 +772,21 @@ async function getArgumentCompletions(
   input: string,
   sessionManager: SessionManager,
   _config: Config | null,
+  sessionId?: string,
 ): Promise<CompletionItem[]> {
+  const conversationId = sessionId
+    ? sessionManager.getConversationId(sessionId)
+    : undefined;
   // Check for /chat resume completion
   const chatResumeMatch = input.match(/^\/chat\s+resume\s+(.*)/i);
   if (chatResumeMatch) {
     const argPrefix = chatResumeMatch[1].toLowerCase();
     try {
-      const { saves } = await sessionManager.listSaves();
+      const { saves } = await sessionManager.listSaves({
+        sessionId,
+        conversationId,
+        filterAutosavesToConversation: true,
+      });
       return saves
         .filter((s) => s.name.toLowerCase().startsWith(argPrefix))
         .map((s) => ({
@@ -790,7 +806,11 @@ async function getArgumentCompletions(
   if (chatDeleteMatch) {
     const argPrefix = chatDeleteMatch[1].toLowerCase();
     try {
-      const { saves } = await sessionManager.listSaves();
+      const { saves } = await sessionManager.listSaves({
+        sessionId,
+        conversationId,
+        filterAutosavesToConversation: true,
+      });
       return saves
         .filter((s) => s.name.toLowerCase().startsWith(argPrefix))
         .map((s) => ({
